@@ -45,6 +45,15 @@ from utils.general import (LOGGER, check_file, check_img_size, check_imshow, che
 from utils.plots import Annotator, colors, save_one_box
 from utils.torch_utils import select_device, time_sync
 
+#Detectron imports 
+#Possiveis soluções: restart connection; install versoes anteriores; clone do repositorio localmente; escrever funçao iou
+from detectron2.detectron2.structures import Boxes, pairwise_iou
+
+from torchvision.ops import batched_nms
+
+import new_utils.anchor_statistics 
+
+#from pod_compare.src.probabilistic_inference.inference_utils import general_anchor_statistics_postprocessing
 
 @torch.no_grad()
 def run(
@@ -106,7 +115,10 @@ def run(
 
     # Run inference
     model.warmup(imgsz=(1 if pt else bs, 3, *imgsz))  # warmup
+
+    final_outputs_list = []
     seen, windows, dt = 0, [], [0.0, 0.0, 0.0]
+
     for path, im, im0s, vid_cap, s in dataset:
         t1 = time_sync()
         im = torch.from_numpy(im).to(device)
@@ -122,7 +134,15 @@ def run(
         pred = model(im, augment=augment, visualize=visualize)
         t3 = time_sync()
         dt[1] += t3 - t2
+        #########################
+        #Output Redundancy
+        #predicted_boxes, predicted_boxes_covariance, predicted_prob, classes_idxs, predicted_prob_vectors = new_utils.anchor_statistics.pre_processing_anchor_stats(pred)
+        outputs = new_utils.anchor_statistics.pre_processing_anchor_stats(pred)
 
+        outputs = new_utils.anchor_statistics.compute_anchor_statistics(outputs,device,im0s)
+        #outputs = general_anchor_statistics_postprocessing(im0s,outputs)
+        final_outputs_list.append(outputs)
+        ##############################
         # NMS
         pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
         dt[2] += time_sync() - t3
