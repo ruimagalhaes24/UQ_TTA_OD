@@ -52,8 +52,7 @@ from detectron2.detectron2.structures import Boxes, pairwise_iou
 from torchvision.ops import batched_nms
 
 import new_utils.anchor_statistics 
-
-#from pod_compare.src.probabilistic_inference.inference_utils import general_anchor_statistics_postprocessing
+from new_utils.evaluation_utils import get_preprocess_ground_truth_instances
 
 @torch.no_grad()
 def run(
@@ -136,12 +135,9 @@ def run(
         dt[1] += t3 - t2
         #########################
         #Output Redundancy
-        #predicted_boxes, predicted_boxes_covariance, predicted_prob, classes_idxs, predicted_prob_vectors = new_utils.anchor_statistics.pre_processing_anchor_stats(pred)
-        outputs = new_utils.anchor_statistics.pre_processing_anchor_stats(pred)
-
-        outputs = new_utils.anchor_statistics.compute_anchor_statistics(outputs,device,im0s)
-        #outputs = general_anchor_statistics_postprocessing(im0s,outputs)
-        final_outputs_list.append(outputs)
+        #outputs = new_utils.anchor_statistics.pre_processing_anchor_stats(pred)
+        #outputs = new_utils.anchor_statistics.compute_anchor_statistics(outputs,device,im0s)
+        #final_outputs_list.append(outputs)
         ##############################
         # NMS
         pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
@@ -221,7 +217,12 @@ def run(
 
         # Print time (inference-only)
         LOGGER.info(f'{s}Done. ({t3 - t2:.3f}s)')
-
+    
+    ##################
+    #Compute Metrics
+    path_to_dataset = "../../media/Data/ruimag/bdd100k/labels"
+    gt_instances = get_preprocess_ground_truth_instances(path_to_dataset)
+    ########################    
     # Print results
     t = tuple(x / seen * 1E3 for x in dt)  # speeds per image
     LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {(1, 3, *imgsz)}' % t)
