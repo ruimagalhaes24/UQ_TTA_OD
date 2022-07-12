@@ -2,22 +2,25 @@ import torch
 from torchvision.ops import batched_nms
 #Detectron imports 
 #Possiveis soluções: restart connection; install versoes anteriores; clone do repositorio localmente; escrever funçao iou
-from detectron2.detectron2.structures import Boxes, pairwise_iou, Instances
+from detectron2.detectron2.structures import BoxMode, Boxes, pairwise_iou, Instances
 
-import gc
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 #This function will grab the prediction output from yolo (1,x,85) and separate this information into different pieces
 #relevant to the output redundancy method
 #LIST THE PIECES HERE
-def pre_processing_anchor_stats(pred_,max_number_bboxes = 1000):
+def pre_processing_anchor_stats(pred_,max_number_bboxes = 20000):
     
-    #temp_pred = torch.squeeze(pred_,dim=0)
-    #obtain list with only predicted boxes and its coordinates
-    predicted_boxes = torch.squeeze(pred_,dim=0)[:,0:4]
+    #Choose only the bbox predictions that assume the presence of an object
+    #This is relevant because the training of the network disregards optimization of the bbox coordinates if there isn't an object present.
     #THE FIFTH VALUE IS THE 0/1 PRESENCE OR NOT OF AN OBJECT
+    presence_of_object = torch.squeeze(pred_,dim=0)[:,5]
+    relevant_prediction = presence_of_object > 0.5
+    #obtain list with only predicted boxes and its coordinates. Also only the ones where there is the possibility of an object
+    predicted_boxes = torch.squeeze(pred_,dim=0)[:,0:4][relevant_prediction]
     #obtain list with the probability scores for each class for each bbox
-    #presence_of_object = temp_pred[:,5]
-    predicted_prob_vectors = torch.squeeze(pred_,dim=0)[:,5:]
+    predicted_prob_vectors = torch.squeeze(pred_,dim=0)[:,5:][relevant_prediction]
     #find the highest confidence score for each bbox and class
     predicted_prob, classes_idxs = torch.max(predicted_prob_vectors, 1)
     #sort list of bboxes by CS (highest to lowest)
@@ -44,14 +47,21 @@ def pre_processing_anchor_stats(pred_,max_number_bboxes = 1000):
     #Antes do iou é necessario converter [x,y,w,h] para [xmin,ymin,xmax,ymax]
     predicted_boxes_converted = predicted_boxes.clone()
     predicted_boxes_converted[:,0] = predicted_boxes[:,0] - predicted_boxes[:,2]/2 #xmin = x - w/2
-    predicted_boxes_converted[:,1] = predicted_boxes[:,0] + predicted_boxes[:,2]/2 #xmax = x + w/2
-    predicted_boxes_converted[:,2] = predicted_boxes[:,1] - predicted_boxes[:,3]/2 #ymin = x - h/2
-    predicted_boxes_converted[:,3] = predicted_boxes[:,1] + predicted_boxes[:,3]/2 #ymin = x + h/2
+    predicted_boxes_converted[:,2] = predicted_boxes[:,0] + predicted_boxes[:,2]/2 #xmax = x + w/2
+    #Atenção aos sinais, isto depende do referencial que estas a considerar. Há quem coloque a origem do referencial em cima à esquerda da bbox
+    #e ha quem coloque o referencial em baixo à esquerda do referencial.
+    #neste caso o eixo vertical esta reversed, o que implica uma mudança de sinal no y
+    #Origem em bottom/left
+    #predicted_boxes_converted[:,1] = predicted_boxes[:,1] + predicted_boxes[:,3]/2 #ymin = y + h/2
+    #predicted_boxes_converted[:,3] = predicted_boxes[:,1] - predicted_boxes[:,3]/2 #ymax = y - h/2
+    #Origem em top/left
+    predicted_boxes_converted[:,1] = predicted_boxes[:,1] - predicted_boxes[:,3]/2 #ymin = y - h/2
+    predicted_boxes_converted[:,3] = predicted_boxes[:,1] + predicted_boxes[:,3]/2 #ymax = y + h/2
 
     return predicted_boxes_converted, predicted_boxes_covariance, predicted_prob, classes_idxs, predicted_prob_vectors
 
 def compute_anchor_statistics(outputs, device, image_size,
-                                nms_threshold = 0.5, max_detections_per_image = 100,affinity_threshold = 0.9):
+                                nms_threshold = 0.5, max_detections_per_image = 20000,affinity_threshold = 0.9):
         
     predicted_boxes, predicted_boxes_covariance, predicted_prob, classes_idxs, predicted_prob_vectors = outputs
     # Get cluster centers using standard nms. Much faster than sequential
@@ -156,8 +166,167 @@ def compute_anchor_statistics(outputs, device, image_size,
             (predicted_boxes.shape + (4,))).to(device)
     return result
 
+def probabilistic_detector_postprocessing(outputs, image_size):
+    """
+    Resize the output instances and scales estimated covariance matrices.
+    The input images are often resized when entering an object detector.
+    As a result, we often need the outputs of the detector in a different
+    resolution from its inputs.
 
+    Args:
+        results (Dict): the raw outputs from the probabilistic detector.
+            `results.image_size` contains the input image resolution the detector sees.
+            This object might be modified in-place.
+        output_height: the desired output resolution.
+        output_width: the desired output resolution.
 
+    Returns:
+        results (Dict): dictionary updated with rescaled boxes and covariance matrices.
+    """
+    #Este passo provavelmente é desnecessário visto que ambos os sizes da imagem são iguais
+    #Neste caso do yolo e como fiz o codigo
+    #No retinanet, ele tem um size para o tamanho original da imagem (que é suposto ser 1280x720)
+    #e outro size quando efetivamente lê a imagem e avalia as matrizes (3,750,1333) pex
+    #Vou deixar estar caso falte algo, either way simplesmente nao vai alterar nada.
+    output_width = image_size.shape[1]
+    output_height = image_size.shape[0]
+    scale_x, scale_y = (output_width /
+                        outputs.image_size[1], output_height /
+                        outputs.image_size[0])
 
+    outputs = Instances((output_height, output_width), **outputs.get_fields())
+
+    output_boxes = outputs.pred_boxes
+    # Scale bounding boxes
+    output_boxes.scale(scale_x, scale_y)
+    output_boxes.clip(outputs.image_size)
+    #ATENÇAO ESTE .NONEMPTY FAZ COM QUE APENAS SOBREM 2 BBOXES FOR SOME REASON
+    #non empty method faz xmax - xmin e ymax - ymin. se estas distancias
+    #forem maior que 0, entao existe caixa.
+    non_empty = output_boxes.nonempty()
+    outputs = outputs[output_boxes.nonempty()]
+
+    # Scale covariance matrices
+    if outputs.has("pred_boxes_covariance"):
+        # Add small value to make sure covariance matrix is well conditioned
+        output_boxes_covariance = outputs.pred_boxes_covariance + 1e-4 * torch.eye(outputs.pred_boxes_covariance.shape[2]).to(device)
+
+        scale_mat = torch.diag_embed(
+            torch.as_tensor(
+                (scale_x,
+                 scale_y,
+                 scale_x,
+                 scale_y))).to(device).unsqueeze(0)
+        scale_mat = torch.repeat_interleave(
+            scale_mat, output_boxes_covariance.shape[0], 0)
+        output_boxes_covariance = torch.matmul(
+            torch.matmul(
+                scale_mat,
+                output_boxes_covariance),
+            torch.transpose(scale_mat, 2, 1))
+        outputs.pred_boxes_covariance = output_boxes_covariance
+    return outputs
+
+def covar_xyxy_to_xywh(output_boxes_covariance):
+    """
+    Converts covariance matrices from top-left bottom-right corner representation to top-left corner
+    and width-height representation.
+
+    Args:
+        output_boxes_covariance: Input covariance matrices.
+
+    Returns:
+        output_boxes_covariance (Nxkxk): Transformed covariance matrices
+    """
+    transformation_mat = torch.as_tensor([[1.0, 0, 0, 0],
+                                          [0, 1.0, 0, 0],
+                                          [-1.0, 0, 1.0, 0],
+                                          [0, -1.0, 0, 1.0]]).to(device).unsqueeze(0)
+    transformation_mat = torch.repeat_interleave(
+        transformation_mat, output_boxes_covariance.shape[0], 0)
+    output_boxes_covariance = torch.matmul(
+        torch.matmul(
+            transformation_mat,
+            output_boxes_covariance),
+        torch.transpose(transformation_mat, 2, 1))
+
+    return output_boxes_covariance
+
+def instances_to_json(instances,img_id):
+    """
+    Dump an "Instances" object to a COCO-format json that's used for evaluation.
+
+    Args:
+        instances (Instances): detectron2 instances
+        img_id (int): the image id
+        cat_mapping_dict (dict): dictionary to map between raw category id from net and dataset id. very important if
+        performing inference on different dataset than that used for training.
+
+    Returns:
+        list[dict]: list of json annotations in COCO format.
+    """
+    num_instance = len(instances)
+    if num_instance == 0:
+        return []
+    #FOR BDD ISTO ESTA ERRADO, TENHO DE FAZER A CONVERSAO
+    #YOLO PARA BDD? ver classes do coco no coco.yaml
+    #YOLO: 0: Person; 1: Bycicle, 2: Car    
+    #BDD 1: pedestrian 2: rider 
+    # 3: car 4: truck | 5: bus|6: train|7: motorcycle|8: bicycle|9: traffic light
+    # 10: traffic sign    
+    #VER CONVERT BDD TO COCO
+    #categories = [{'id': 1, 'name': 'car', 'supercategory': 'vehicle'},
+    #              {'id': 2, 'name': 'bus', 'supercategory': 'vehicle'},
+    #              {'id': 3, 'name': 'truck', 'supercategory': 'vehicle'},
+    #              {'id': 4, 'name': 'person', 'supercategory': 'vehicle'},
+    #              {'id': 5, 'name': 'rider', 'supercategory': 'vehicle'},
+    #              {'id': 6, 'name': 'bike', 'supercategory': 'vehicle'},
+    #              {'id': 7, 'name': 'motor', 'supercategory': 'vehicle'}
+    #              ]
+    #YOLO | BDD
+    #2 car | 1 car
+    #5 bus | 2 bus
+    #7 truck| 3 truck
+    #0 person| 4 person
+    #-1 rider| 5 rider
+    #1 bycicle | 6 bike 
+    #3 motorcycle | 7 motor
     
-    #return predicted_boxes_list, predicted_boxes_covariance_list, predicted_prob_vectors_list
+    #IMPORTANTE, ESTOU A FICAR COM POUCAS BBOXES FINAIS (13 DE 100 NA PRIMEIRA IMAGEM)
+    #ISTO ACONTECE PORQUE GRANDE PARTE DAS PREVISOES SAO DE OUTRAS CLASSES (STREET LIGHTS, SIGNS,ETC)
+    #PODE SER RELEVANTE FAZER UM PRE PROCESSAMENTO ONDE NA PARTE DA OUTPUT REDUNDANCY SO ESCOLHO
+    #AS 100 MELHORES BBOXES DAS CLASSES QUE ME INTERESSAM!!!
+    cat_mapping_dict = {2: 1, 5: 2, 7: 3, 0: 4, 1: 6, 3: 4}
+
+    boxes = instances.pred_boxes.tensor.cpu().numpy()
+    boxes = BoxMode.convert(boxes, BoxMode.XYXY_ABS, BoxMode.XYWH_ABS)
+    boxes = boxes.tolist()
+    scores = instances.scores.cpu().tolist()
+    classes = instances.pred_classes.cpu().tolist()
+
+    classes = [
+        cat_mapping_dict[class_i] if class_i in cat_mapping_dict.keys() else -
+        1 for class_i in classes]
+
+    pred_cls_probs = instances.pred_cls_probs.cpu().tolist()
+
+    if instances.has("pred_boxes_covariance"):
+        pred_boxes_covariance = covar_xyxy_to_xywh(
+            instances.pred_boxes_covariance).cpu().tolist()
+    else:
+        pred_boxes_covariance = []
+
+    results = []
+    for k in range(num_instance):
+        if classes[k] != -1:
+            result = {
+                "image_id": img_id,
+                "category_id": classes[k],
+                "bbox": boxes[k],
+                "score": scores[k],
+                "cls_prob": pred_cls_probs[k],
+                "bbox_covar": pred_boxes_covariance[k]
+            }
+
+            results.append(result)
+    return results
