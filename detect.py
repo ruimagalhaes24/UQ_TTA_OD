@@ -41,9 +41,10 @@ ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 from models.common import DetectMultiBackend
 from utils.dataloaders import IMG_FORMATS, VID_FORMATS, LoadImages, LoadStreams
 from utils.general import (LOGGER, check_file, check_img_size, check_imshow, check_requirements, colorstr, cv2,
-                           increment_path, non_max_suppression, print_args, scale_coords, strip_optimizer, xyxy2xywh)
+                           increment_path, non_max_suppression, print_args, scale_coords, strip_optimizer, xywhn2xyxy, xyxy2xywh)
 from utils.plots import Annotator, colors, save_one_box
 from utils.torch_utils import select_device, time_sync
+from new_utils.anchor_statistics import altered_yolo_nms
 
 #Detectron imports 
 #Possiveis soluções: restart connection; install versoes anteriores; clone do repositorio localmente; escrever funçao iou
@@ -52,8 +53,9 @@ from detectron2.detectron2.structures import Boxes, pairwise_iou
 from torchvision.ops import batched_nms
 
 import new_utils.anchor_statistics 
-from new_utils.evaluation_utils import get_preprocess_ground_truth_instances, get_preprocess_pred_instances, get_matched_results
+from new_utils.evaluation_utils import get_preprocess_ground_truth_instances, get_preprocess_pred_instances, get_matched_results, compute_nll, compute_calibration_uncertainty_errors, compute_average_precision
 import json
+from utils.general import xywh2xyxy 
 
 @torch.no_grad()
 def run(
@@ -133,26 +135,38 @@ def run(
 
             # Inference
             visualize = increment_path(save_dir / Path(path).stem, mkdir=True) if visualize else False
+            #MC DROPOUT
+            #for runs in range(20):
+            #    pred = model(im,augment=augment,visualize=visualize)
             pred = model(im, augment=augment, visualize=visualize)
             t3 = time_sync()
             dt[1] += t3 - t2
             #########################
             #Output Redundancy
-            outputs = new_utils.anchor_statistics.pre_processing_anchor_stats(pred)
-            outputs = new_utils.anchor_statistics.compute_anchor_statistics(outputs,device,im0s)
+            #Convert output coordinates xywh to xyxy
+            # Rescale boxes from img_size to im0 size
+            pred_redundancy = torch.clone(pred)
+            pred_redundancy = torch.squeeze(pred_redundancy,dim=0)
+            pred_redundancy[:, :4] = xywh2xyxy(pred_redundancy[:, :4])
+            pred_redundancy[:, :4] = scale_coords(im.shape[2:], pred_redundancy[:, :4], im0s.shape).round()
+            # Rescale boxes from img_size to im0 size
+            outputs = new_utils.anchor_statistics.pre_processing_anchor_stats(pred_redundancy)
+            outputs = new_utils.anchor_statistics.compute_anchor_statistics(outputs,device,im0s,pred)
             outputs = new_utils.anchor_statistics.probabilistic_detector_postprocessing(outputs,im0s)
             outputs = new_utils.anchor_statistics.instances_to_json(outputs,dataset.count-1)
             final_outputs_list.extend(outputs)
             ##############################
             # NMS
-            pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
+            #pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
             dt[2] += time_sync() - t3
 
             # Second-stage classifier (optional)
             # pred = utils.general.apply_classifier(pred, classifier_model, im, im0s)
-
             # Process predictions
-            for i, det in enumerate(pred):  # per image
+            draw_clusters = True
+            if draw_clusters:
+                list_of_classes = []
+                names = ['car','bus','truck','person','rider','bycicle','motorcycle']
                 seen += 1
                 if webcam:  # batch_size >= 1
                     p, im0, frame = path[i], im0s[i].copy(), dataset.count
@@ -160,65 +174,105 @@ def run(
                 else:
                     p, im0, frame = path, im0s.copy(), getattr(dataset, 'frame', 0)
 
-                p = Path(p)  # to Path
-                save_path = str(save_dir / p.name)  # im.jpg
-                txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')  # im.txt
-                s += '%gx%g ' % im.shape[2:]  # print string
-                gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
-                imc = im0.copy() if save_crop else im0  # for save_crop
                 annotator = Annotator(im0, line_width=line_thickness, example=str(names))
-                if len(det):
-                    # Rescale boxes from img_size to im0 size
-                    det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im0.shape).round()
+                for i, det in enumerate(outputs):  # per image
+                    xyxy =  [det['bbox'][0], 
+                             det['bbox'][1],
+                             det['bbox'][0] + det['bbox'][2],
+                             det['bbox'][1] + det['bbox'][3]]
+                    p = Path(p)  # to Path
+                    save_path = str(save_dir / p.name)  # im.jpg
+                    txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')  # im.txt
+                    gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
+                    imc = im0.copy() if save_crop else im0  # for save_crop
 
+                    c = int(det['category_id'])  # integer class
+                    label = None if hide_labels else (names[c] if hide_conf else f'{names[c-1]} {det["score"]:.2f}')
+                    annotator.box_label(xyxy, label, color=colors(c, True))
                     # Print results
-                    for c in det[:, -1].unique():
-                        n = (det[:, -1] == c).sum()  # detections per class
-                        s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
+                    list_of_classes.append(c)
+                s += '%gx%g ' % im.shape[2:]  # print string
+                for c in set(list_of_classes):
+                    n = list_of_classes.count(c) # detections per class
+                    s += f"{n} {names[int(c-1)]}{'s' * (n > 1)}, "  # add to string
+            else:
+                for i, det in enumerate(pred):  # per image
+                    seen += 1
+                    if webcam:  # batch_size >= 1
+                        p, im0, frame = path[i], im0s[i].copy(), dataset.count
+                        s += f'{i}: '
+                    else:
+                        p, im0, frame = path, im0s.copy(), getattr(dataset, 'frame', 0)
 
-                    # Write results
-                    for *xyxy, conf, cls in reversed(det):
-                        if save_txt:  # Write to file
-                            xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-                            line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
-                            with open(f'{txt_path}.txt', 'a') as f:
-                                f.write(('%g ' * len(line)).rstrip() % line + '\n')
+                    p = Path(p)  # to Path
+                    save_path = str(save_dir / p.name)  # im.jpg
+                    txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')  # im.txt
+                    s += '%gx%g ' % im.shape[2:]  # print string
+                    ###########################
+                    #path_to_dataset = "../../media/Data/ruimag/bdd100k/labels"
+                    #preprocessed_gt_instances = get_preprocess_ground_truth_instances(path_to_dataset)
+                    #annotator = Annotator(im0, line_width=line_thickness, example=str(names))
+                    #teste = preprocessed_gt_instances['gt_boxes'][0][0]
+                    ###for box in preprocessed_gt_instances['gt_boxes'][0]:
+                    ###    annotator.box_label(box, 'popo', (0,212,187))
+                    #im0 = annotator.result()
+                    #cv2.imwrite(save_path, im0)
+                    ###########################
+                    gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
+                    imc = im0.copy() if save_crop else im0  # for save_crop
+                    annotator = Annotator(im0, line_width=line_thickness, example=str(names))
+                    if len(det):
+                        # Rescale boxes from img_size to im0 size
+                        det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im0.shape).round()
 
-                        if save_img or save_crop or view_img:  # Add bbox to image
-                            c = int(cls)  # integer class
-                            label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
-                            annotator.box_label(xyxy, label, color=colors(c, True))
-                        if save_crop:
-                            save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
+                        # Print results
+                        for c in det[:, -1].unique():
+                            n = (det[:, -1] == c).sum()  # detections per class
+                            s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
-                # Stream results
-                im0 = annotator.result()
-                if view_img:
-                    if p not in windows:
-                        windows.append(p)
-                        cv2.namedWindow(str(p), cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)  # allow window resize (Linux)
-                        cv2.resizeWindow(str(p), im0.shape[1], im0.shape[0])
-                    cv2.imshow(str(p), im0)
-                    cv2.waitKey(1)  # 1 millisecond
+                        # Write results
+                        for *xyxy, conf, cls in reversed(det):
+                            if save_txt:  # Write to file
+                                xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
+                                line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
+                                with open(f'{txt_path}.txt', 'a') as f:
+                                    f.write(('%g ' * len(line)).rstrip() % line + '\n')
 
-                # Save results (image with detections)
-                if save_img:
-                    if dataset.mode == 'image':
-                        cv2.imwrite(save_path, im0)
-                    else:  # 'video' or 'stream'
-                        if vid_path[i] != save_path:  # new video
-                            vid_path[i] = save_path
-                            if isinstance(vid_writer[i], cv2.VideoWriter):
-                                vid_writer[i].release()  # release previous video writer
-                            if vid_cap:  # video
-                                fps = vid_cap.get(cv2.CAP_PROP_FPS)
-                                w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                                h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                            else:  # stream
-                                fps, w, h = 30, im0.shape[1], im0.shape[0]
-                            save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
-                            vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-                        vid_writer[i].write(im0)
+                            if save_img or save_crop or view_img:  # Add bbox to image
+                                c = int(cls)  # integer class
+                                label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
+                                annotator.box_label(xyxy, label, color=colors(c, True))
+                            if save_crop:
+                                save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
+
+            # Stream results
+            im0 = annotator.result()
+            if view_img:
+                if p not in windows:
+                    windows.append(p)
+                    cv2.namedWindow(str(p), cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)  # allow window resize (Linux)
+                    cv2.resizeWindow(str(p), im0.shape[1], im0.shape[0])
+                cv2.imshow(str(p), im0)
+                cv2.waitKey(1)  # 1 millisecond
+
+            # Save results (image with detections)
+            if save_img:
+                if dataset.mode == 'image':
+                    cv2.imwrite(save_path, im0)
+                else:  # 'video' or 'stream'
+                    if vid_path[i] != save_path:  # new video
+                        vid_path[i] = save_path
+                        if isinstance(vid_writer[i], cv2.VideoWriter):
+                            vid_writer[i].release()  # release previous video writer
+                        if vid_cap:  # video
+                            fps = vid_cap.get(cv2.CAP_PROP_FPS)
+                            w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                            h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        else:  # stream
+                            fps, w, h = 30, im0.shape[1], im0.shape[0]
+                        save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
+                        vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+                    vid_writer[i].write(im0)
 
             # Print time (inference-only)
             LOGGER.info(f'{s}Done. ({t3 - t2:.3f}s)')
@@ -235,15 +289,11 @@ def run(
     path_to_predictions = 'code/yolov5/methods/output_redundancy'
     path_to_results = 'code/yolov5/methods/output_redundancy'
     preprocessed_gt_instances = get_preprocess_ground_truth_instances(path_to_dataset)
-#    max_number_gt_boxes = 0
-#    for i, image_annotations in preprocessed_gt_instances['gt_boxes'].items():
-#        
-#        if image_annotations.size()[0] > max_number_gt_boxes:
-#            max_number_gt_boxes = image_annotations.size()[0]
-#            index = i
-
     preprocessed_pred_instances = get_preprocess_pred_instances(path_to_predictions)
     matched_results = get_matched_results(path_to_results, preprocessed_gt_instances, preprocessed_pred_instances)
+    #mAP_results, optimal_score_threshold_f1  = compute_average_precision(path_to_results,path_to_dataset)
+    final_results_nll , final_results_per_class_nll = compute_nll(matched_results)
+    final_results_calibration = compute_calibration_uncertainty_errors(matched_results)
     ########################
     if inference_mode:
         # Print results

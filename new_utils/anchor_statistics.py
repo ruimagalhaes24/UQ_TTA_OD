@@ -1,8 +1,15 @@
 import torch
+import torchvision
 from torchvision.ops import batched_nms
+from utils.metrics import box_iou, fitness
+from utils.general import xywh2xyxy
 #Detectron imports 
 #Possiveis soluções: restart connection; install versoes anteriores; clone do repositorio localmente; escrever funçao iou
 from detectron2.detectron2.structures import BoxMode, Boxes, pairwise_iou, Instances
+
+import time
+from new_utils.scoring_rules import is_pos_def
+import numpy as np
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -15,22 +22,24 @@ def pre_processing_anchor_stats(pred_,max_number_bboxes = 20000):
     #Choose only the bbox predictions that assume the presence of an object
     #This is relevant because the training of the network disregards optimization of the bbox coordinates if there isn't an object present.
     #THE FIFTH VALUE IS THE 0/1 PRESENCE OR NOT OF AN OBJECT
-    presence_of_object = torch.squeeze(pred_,dim=0)[:,5]
-    relevant_prediction = presence_of_object > 0.5
+    presence_of_object = torch.squeeze(pred_,dim=0)[:,4:5]
     #obtain list with only predicted boxes and its coordinates. Also only the ones where there is the possibility of an object
-    predicted_boxes = torch.squeeze(pred_,dim=0)[:,0:4][relevant_prediction]
+    predicted_boxes = torch.squeeze(pred_,dim=0)[:,0:4]
     #obtain list with the probability scores for each class for each bbox
-    predicted_prob_vectors = torch.squeeze(pred_,dim=0)[:,5:][relevant_prediction]
+    predicted_prob_vectors = torch.squeeze(pred_,dim=0)[:,5:]
+    #Here itry the confidence score of yolo: objecteness_Score*class_score!
+    #x[:, 5:] *= x[:, 4:5]
+    predicted_prob_vectors *= presence_of_object
     #find the highest confidence score for each bbox and class
     predicted_prob, classes_idxs = torch.max(predicted_prob_vectors, 1)
     #sort list of bboxes by CS (highest to lowest)
-    predicted_prob, sorted_idxs = torch.sort(predicted_prob, descending = True)
-    #sort all other lists to match the order obtained previously (highest to lowest CS)
-    predicted_boxes = predicted_boxes[sorted_idxs]
+    #predicted_prob, sorted_idxs = torch.sort(predicted_prob, descending = True)
+    ##sort all other lists to match the order obtained previously (highest to lowest CS)
+    #predicted_boxes = predicted_boxes[sorted_idxs]
     predicted_boxes_covariance = []
-    #predicted_prob = predicted_prob
-    classes_idxs = classes_idxs[sorted_idxs]
-    predicted_prob_vectors = predicted_prob_vectors[sorted_idxs]
+    ##predicted_prob = predicted_prob
+    #classes_idxs = classes_idxs[sorted_idxs]
+    #predicted_prob_vectors = predicted_prob_vectors[sorted_idxs]
     
     #to try and avoid the memory problem (18900 was too much) 16750 seems to be the maximum
     #Pelo quue percebi, isto simplesmente tem a ver com a memory usage do gpu. Se outra pessoa estiver a correr outro programa
@@ -38,16 +47,16 @@ def pre_processing_anchor_stats(pred_,max_number_bboxes = 20000):
     #FAZER ESTUDO SOBRE QUANTAS BBOXES O RETINANET USA. a volta de 3900, NAO PASSOU DAS 4000!
     #PROCURAR POR PRE PROCESSAMENTO, COMO E QUE ELE ESCOLHE ES
     #Lets try with fucntions only later, maybe it works.
-    predicted_boxes = predicted_boxes[:max_number_bboxes]
-    predicted_prob = predicted_prob[:max_number_bboxes]
-    classes_idxs = classes_idxs[:max_number_bboxes]
-    predicted_boxes_covariance = []
-    predicted_prob_vectors = predicted_prob_vectors[:max_number_bboxes]
+    #predicted_boxes = predicted_boxes[:max_number_bboxes]
+    #predicted_prob = predicted_prob[:max_number_bboxes]
+    #classes_idxs = classes_idxs[:max_number_bboxes]
+    #predicted_boxes_covariance = []
+    #predicted_prob_vectors = predicted_prob_vectors[:max_number_bboxes]
 
     #Antes do iou é necessario converter [x,y,w,h] para [xmin,ymin,xmax,ymax]
-    predicted_boxes_converted = predicted_boxes.clone()
-    predicted_boxes_converted[:,0] = predicted_boxes[:,0] - predicted_boxes[:,2]/2 #xmin = x - w/2
-    predicted_boxes_converted[:,2] = predicted_boxes[:,0] + predicted_boxes[:,2]/2 #xmax = x + w/2
+    #predicted_boxes_converted = predicted_boxes.clone()
+    #predicted_boxes_converted[:,0] = predicted_boxes[:,0] - predicted_boxes[:,2]/2 #xmin = x - w/2
+    #predicted_boxes_converted[:,2] = predicted_boxes[:,0] + predicted_boxes[:,2]/2 #xmax = x + w/2
     #Atenção aos sinais, isto depende do referencial que estas a considerar. Há quem coloque a origem do referencial em cima à esquerda da bbox
     #e ha quem coloque o referencial em baixo à esquerda do referencial.
     #neste caso o eixo vertical esta reversed, o que implica uma mudança de sinal no y
@@ -55,41 +64,123 @@ def pre_processing_anchor_stats(pred_,max_number_bboxes = 20000):
     #predicted_boxes_converted[:,1] = predicted_boxes[:,1] + predicted_boxes[:,3]/2 #ymin = y + h/2
     #predicted_boxes_converted[:,3] = predicted_boxes[:,1] - predicted_boxes[:,3]/2 #ymax = y - h/2
     #Origem em top/left
-    predicted_boxes_converted[:,1] = predicted_boxes[:,1] - predicted_boxes[:,3]/2 #ymin = y - h/2
-    predicted_boxes_converted[:,3] = predicted_boxes[:,1] + predicted_boxes[:,3]/2 #ymax = y + h/2
+    #predicted_boxes_converted[:,1] = predicted_boxes[:,1] - predicted_boxes[:,3]/2 #ymin = y - h/2
+    #predicted_boxes_converted[:,3] = predicted_boxes[:,1] + predicted_boxes[:,3]/2 #ymax = y + h/2
 
-    return predicted_boxes_converted, predicted_boxes_covariance, predicted_prob, classes_idxs, predicted_prob_vectors
+    return predicted_boxes, predicted_boxes_covariance, predicted_prob, classes_idxs, predicted_prob_vectors
 
-def compute_anchor_statistics(outputs, device, image_size,
-                                nms_threshold = 0.5, max_detections_per_image = 20000,affinity_threshold = 0.9):
+def altered_yolo_nms(prediction,
+                        conf_thres=0.25,
+                        iou_thres=0.45,
+                        classes=None,
+                        agnostic=False,
+                        multi_label=False,
+                        labels=(),
+                        max_det=300):
+
+    
+    bs = prediction.shape[0]  # batch size
+    nc = prediction.shape[2] - 5  # number of classes
+    xc = candidates = prediction[..., 4] > conf_thres  # candidates
+    #print(candidates.sum())
+    indices_candidates = candidates[0].nonzero()
+    #xc = prediction[..., 4] > 0  # using all possible boxes
+    # Checks
+    assert 0 <= conf_thres <= 1, f'Invalid Confidence threshold {conf_thres}, valid values are between 0.0 and 1.0'
+    assert 0 <= iou_thres <= 1, f'Invalid IoU {iou_thres}, valid values are between 0.0 and 1.0'
+
+    # Settings
+    # min_wh = 2  # (pixels) minimum box width and height
+    max_wh = 7680  # (pixels) maximum box width and height
+    max_nms = 30000  # maximum number of boxes into torchvision.ops.nms()
+    redundant = True  # require redundant detections
+    multi_label &= nc > 1  # multiple labels per box (adds 0.5ms/img)
+    merge = False  # use merge-NMS
+
+    output = [torch.zeros((0, 6), device=prediction.device)] * bs
+    for xi, x in enumerate(prediction):  # image index, image inference
+        x = x[xc[xi]]  # confidence
+
+        # If none remain process next image
+        if not x.shape[0]:
+            final_indices = []
+            continue
+
+        # Compute conf
+        x[:, 5:] *= x[:, 4:5]  # conf = obj_conf * cls_conf
+
+        # Box (center x, center y, width, height) to (x1, y1, x2, y2)
+        box = xywh2xyxy(x[:, :4])
+
+        # Detections matrix nx6 (xyxy, conf, cls)
+        conf, j = x[:, 5:].max(1, keepdim=True)
+        x = torch.cat((box, conf, j.float()), 1)[conf.view(-1) > conf_thres]
+        indices_candidates = indices_candidates[conf.view(-1) > conf_thres]
+        #x = torch.cat((box, conf, j.float()), 1)[conf.view(-1) > 0]#usando todas deteçoes
+
+        # Check shape
+        n = x.shape[0]  # number of boxes
+        if not n:  # no boxes
+            final_indices = []
+            continue
+        elif n > max_nms:  # excess boxes
+            x = x[x[:, 4].argsort(descending=True)[:max_nms]]  # sort by confidence
+
+        # Batched NMS
+        c = x[:, 5:6] * (0 if agnostic else max_wh)  # classes
+        boxes, scores = x[:, :4] + c, x[:, 4]  # boxes (offset by class), scores
+        i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
+        if i.shape[0] > max_det:  # limit detections
+            i = i[:max_det]
+        if merge and (1 < n < 3E3):  # Merge NMS (boxes merged using weighted mean)
+            # update boxes as boxes(i,4) = weights(i,n) * boxes(n,4)
+            iou = box_iou(boxes[i], boxes) > iou_thres  # iou matrix
+            weights = iou * scores[None]  # box weights
+            x[i, :4] = torch.mm(weights, x[:, :4]).float() / weights.sum(1, keepdim=True)  # merged boxes
+            if redundant:
+                i = i[iou.sum(1) > 1]  # require redundancy
+        teste = indices_candidates[i]
+        final_indices = torch.squeeze(indices_candidates[i],dim=1)
+        output[xi] = x[i]
+    return final_indices, output
+
+def compute_anchor_statistics(outputs, device, image_size, original_predictions_yolo,
+                                nms_threshold = 0.5, max_detections_per_image = 100,affinity_threshold = 0.95):
         
     predicted_boxes, predicted_boxes_covariance, predicted_prob, classes_idxs, predicted_prob_vectors = outputs
     # Get cluster centers using standard nms. Much faster than sequential
     # clustering.
     #keep vai possuir os indices das bbox com CS mais altos, por ordem,
-    keep = batched_nms(
-        predicted_boxes,
-        predicted_prob,
-        classes_idxs,
-        nms_threshold)
-
-    #aqui estamos apenas a limitar o numero maximo de bboxes
-    keep = keep[: max_detections_per_image]
+    #keep = batched_nms(
+    #    predicted_boxes,
+    #    predicted_prob,
+    #    classes_idxs,
+    #    nms_threshold)
+#
+    ##aqui estamos apenas a limitar o numero maximo de bboxes
+    #keep = keep[: max_detections_per_image]
+    #UTILIZANDO O NMS ALTERADO DO YOLO!
+    conf_thres = 0.25
+    iou_thres = 0.45
+    classes = None
+    agnostic_nms = False
+    max_det = 1000
+    keep, output = altered_yolo_nms(original_predictions_yolo, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
 
     #for i in range(81):
     #    print(predicted_prob_vectors[0][i])
     # Get pairwise iou matrix
     #obtem matriz MxN com iou entre boxes (diagonal é 1 e é simetrica)
-    match_quality_matrix = pairwise_iou(Boxes(predicted_boxes), Boxes(predicted_boxes))
+    match_quality_matrix = pairwise_iou(Boxes(predicted_boxes[keep,:]), Boxes(predicted_boxes))
 
     #seleciona os ious das bbox que sobraram
     #fica uma matriz com 100 bbox(as melhores) por 1957 bbox(todas as outras possibilidades)
-    clusters_inds = match_quality_matrix[keep, :]
+    #clusters_inds = match_quality_matrix[keep, :]
     #filtra as bbox que possuem iou acima de um certo valor
     #por linha esta matriz vai te dizer quais sao as bbox que partilham bastante o espaço
     #com essa bbox da linha, que vai ser o cluster center
-    clusters_inds = clusters_inds > affinity_threshold
-
+    #clusters_inds = clusters_inds > affinity_threshold
+    clusters_inds = match_quality_matrix > affinity_threshold
     # Compute mean and covariance for every cluster.
     predicted_prob_vectors_list = []
     predicted_boxes_list = []
@@ -118,6 +209,10 @@ def compute_anchor_statistics(outputs, device, image_size,
             residuals = (box_cluster - cluster_mean).unsqueeze(2)
             #residuals para o calculo da variancia (valor do ponto- media)
             #formula da matriz da covariancia
+            denominador = max((box_cluster.shape[0] - 1), 1.0)
+            numerador = torch.transpose(residuals, 2, 1)
+            numerador = torch.matmul(residuals, torch.transpose(residuals, 2, 1))
+            numerador = torch.sum(torch.matmul(residuals, torch.transpose(residuals, 2, 1)), 0)
             cluster_covariance = torch.sum(torch.matmul(residuals, torch.transpose(
                 residuals, 2, 1)), 0) / max((box_cluster.shape[0] - 1), 1.0)
 
@@ -138,7 +233,20 @@ def compute_anchor_statistics(outputs, device, image_size,
             if predicted_boxes_covariance is not None:
                 if len(predicted_boxes_covariance) > 0:
                     cluster_covariance = predicted_boxes_covariance[center_idx]
-
+        #################
+        #Test positive definite
+        teste1 = cluster_covariance + 1e-4 * torch.eye(4).to(device)
+        cov_matrix_np = cluster_covariance.cpu().numpy()        
+        teste = cov_matrix_np + (1e-4 * np.eye(4))
+        if not is_pos_def(cluster_covariance + 1e-4 * torch.eye(4).to(device)):
+            if  torch.allclose(cluster_covariance + 1e-4 * torch.eye(4).to(device), (cluster_covariance+ 1e-4 * torch.eye(4).to(device)).T):
+                try:
+                    np.linalg.cholesky(cov_matrix_np + 1e-4 * np.eye(4))
+                except np.linalg.LinAlgError:
+                    print('É SIMETRICA, MAS NAO DA O CHOLESKY')
+            else:
+                print('NAO É SIMETRICA')
+        #########################
         predicted_boxes_list.append(cluster_mean) #lista que vai conter a media de cada cluster 
         predicted_boxes_covariance_list.append(cluster_covariance) #lista que vai conter a cov de cada cluster
         predicted_prob_vectors_list.append(cluster_probs_vector) #list que vai conter a media das classes de cada cluster
@@ -158,12 +266,12 @@ def compute_anchor_statistics(outputs, device, image_size,
         result.pred_boxes_covariance = torch.stack( 
             predicted_boxes_covariance_list, 0) ##lista com a matriz cov para cada cluster center 100, 4,4
     else:
-        result.pred_boxes = Boxes(predicted_boxes)
-        result.scores = torch.zeros(predicted_boxes.shape[0]).to(device)
-        result.pred_classes = classes_idxs
-        result.pred_cls_probs = predicted_prob_vectors
+        result.pred_boxes = Boxes(predicted_boxes[keep,:])
+        result.scores = torch.zeros(predicted_boxes[keep,:].shape[0]).to(device)
+        result.pred_classes = classes_idxs[keep]
+        result.pred_cls_probs = predicted_prob_vectors[keep,:]
         result.pred_boxes_covariance = torch.empty(
-            (predicted_boxes.shape + (4,))).to(device)
+            (predicted_boxes[keep,:].shape + (4,))).to(device)
     return result
 
 def probabilistic_detector_postprocessing(outputs, image_size):
@@ -296,7 +404,7 @@ def instances_to_json(instances,img_id):
     #ISTO ACONTECE PORQUE GRANDE PARTE DAS PREVISOES SAO DE OUTRAS CLASSES (STREET LIGHTS, SIGNS,ETC)
     #PODE SER RELEVANTE FAZER UM PRE PROCESSAMENTO ONDE NA PARTE DA OUTPUT REDUNDANCY SO ESCOLHO
     #AS 100 MELHORES BBOXES DAS CLASSES QUE ME INTERESSAM!!!
-    cat_mapping_dict = {2: 1, 5: 2, 7: 3, 0: 4, 1: 6, 3: 4}
+    cat_mapping_dict = {2: 1, 5: 2, 7: 3, 0: 4, 1: 6, 3: 7}
 
     boxes = instances.pred_boxes.tensor.cpu().numpy()
     boxes = BoxMode.convert(boxes, BoxMode.XYXY_ABS, BoxMode.XYWH_ABS)
@@ -315,7 +423,7 @@ def instances_to_json(instances,img_id):
             instances.pred_boxes_covariance).cpu().tolist()
     else:
         pred_boxes_covariance = []
-
+    #pred_boxes_covariance = instances.pred_boxes_covariance.cpu().tolist()
     results = []
     for k in range(num_instance):
         if classes[k] != -1:
