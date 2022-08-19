@@ -332,6 +332,29 @@ class DetectMultiBackend(nn.Module):
 
         if pt:  # PyTorch
             model = attempt_load(weights if isinstance(weights, list) else w, device=device)
+            #print(model)
+            layers_name = [name for name, _ in model.named_modules()][1:]
+            indices = [7]
+            modules = [nn.Dropout2d(p=0.2)]
+            import re
+            #for index, module in zip(indices, modules):
+            #    layer_name = re.sub(r'(.)(\d)', r'[\2]', layers_name[index])
+            #    exec("model.{name} = nn.Sequential(model.{name}, module)".format(name = layer_name))
+            #print(model.[0])
+            teste = model.model[21]
+            #model.model[21] = nn.Sequential(model.model[21], nn.Dropout2d(p=0.2))
+            #teste = model.model[21].conv
+            #model.model[21].conv = nn.Sequential(nn.Dropout2d(p=0.5,inplace=True), model.model[21].conv)
+            #model.model[21].conv = nn.Sequential(model.model[21].conv, nn.Dropout2d(p=0.2))
+            teste = model.model[24].m[0]
+            #model.model[24].m[0] = nn.Sequential(model.model[24].m[0], nn.Dropout2d(p=0.2,inplace=True))
+            #teste = model.model[2].m[0]
+            #print(model.model[2].C3)
+            #print(model)
+            for m in model.modules():
+                if m.__class__.__name__.startswith('Dropout'):
+                    m.train()
+            
             stride = max(int(model.stride.max()), 32)  # model stride
             names = model.module.names if hasattr(model, 'module') else model.names  # get class names
             model.half() if fp16 else model.float()

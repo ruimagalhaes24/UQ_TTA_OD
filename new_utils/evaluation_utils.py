@@ -7,6 +7,18 @@ import numpy as np
 import tqdm
 from detectron2.detectron2.structures import Boxes, pairwise_iou
 
+import new_utils.scoring_rules
+#pip3 install uncertainty-calibration
+import calibration as cal
+from prettytable import PrettyTable
+
+# Coco evaluator tools
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+
+import copy
+from new_utils.scoring_rules import is_pos_def
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 """
 def get_per_frame_preprocessed_instances():
@@ -116,7 +128,7 @@ def get_preprocess_pred_instances(path_to_predictions_file):
                     transformation_mat,
                     box_covar),
                 transformation_mat.T).tolist()
-
+            #cov_pred = box_covar
             predicted_covar_mats[predicted_instance['image_id']] = torch.cat(
                 (predicted_covar_mats[predicted_instance['image_id']].to(device), torch.as_tensor([cov_pred], dtype=torch.float32).to(device)))
 
@@ -364,3 +376,515 @@ def get_matched_results(path_to_results, preprocessed_gt_instances, preprocessed
                 "matched_results.pth"))
 
         return matched_results
+
+def compute_nll(matched_results_):
+    #Category mapping YOLO to BDD
+    #cat_mapping_dict = {2: 1, 5: 2, 7: 3, 0: 4, 1: 6, 3: 7}
+    #É preciso ter em atençao que nas ground truths a categoria "rider" nao existe no yolo. sera que devia entao de tirá-la das gt???
+    #Ja reparei em algumas imagens que ele classifica o rider como sendo "person". Outra opçao tambem poderia ser colocar a label como "motorcycle"
+    #aqui vou ter que colocar o equivalente da label no vetor de 80 classes do yolo
+    #YOLO | BDD
+    #2 car | 1 car
+    #5 bus | 2 bus
+    #7 truck| 3 truck
+    #0 person| 4 person
+    #-1 rider| 5 rider
+    #1 bycicle | 6 bike 
+    #3 motorcycle | 7 motor
+    matched_results = copy.deepcopy(matched_results_)
+    cat_mapping_dict = {7: 3, 6: 1, 5: 0, 4: 0, 3: 7, 2: 5, 1: 2}
+    #cat_mapping_dict = {1:1,2:2,3:3,4:4,5:5,6:6,7:7}
+    with torch.no_grad():
+        # Build preliminary dicts required for computing classification scores.
+        for matched_results_key in matched_results.keys():
+            #Nao percebo porque é que a parte do category mappiung é necessaria se as predictions ja vem correto.
+        #Esta parte é necessaria porque pode ser necessario converter as ground truths para as categorias de um dataset especifico, tipo kitti ou lyft! 
+            if 'gt_cat_idxs' in matched_results[matched_results_key].keys():
+                # First we convert the written things indices to contiguous
+                # indices.
+                gt_converted_cat_idxs = matched_results[matched_results_key]['gt_cat_idxs'].squeeze(
+                    1)
+                #ele converte as classes de 1,2,3,4,5,6,7 para 01,2,3,4,5,6. Sera que isto é apenas e só porque o output final das classes é um vetor com 7 valores
+                #e por isso quer fazer essa equivalencia? Sim é! Isto porque esse é o formato do output final do retinanet
+                #NEste caso tu tens de fazer o equivalente mas para o YOLO, tens de ir buscar os indexes na lista das classes que contem os cs que queres
+                gt_converted_cat_idxs = torch.as_tensor([cat_mapping_dict[class_idx.cpu(
+                ).tolist()] for class_idx in gt_converted_cat_idxs]).to(device)
+                matched_results[matched_results_key]['gt_converted_cat_idxs'] = gt_converted_cat_idxs.to(
+                    device)
+                #print(torch.unique(gt_converted_cat_idxs))
+                if 'predicted_cls_probs' in matched_results[matched_results_key].keys(
+                ):
+                    predicted_cls_probs = matched_results[matched_results_key]['predicted_cls_probs']
+                    # This is required for evaluation of retinanet based
+                    # detections.
+                    #Este passo aqui vai obter o CS que a previsao tem para a categoria que é suposto ser da ground truth
+                    matched_results[matched_results_key]['predicted_score_of_gt_category'] = torch.gather(
+                        predicted_cls_probs, 1, gt_converted_cat_idxs.unsqueeze(1)).squeeze(1)
+                matched_results[matched_results_key]['gt_cat_idxs'] = gt_converted_cat_idxs
+            else:
+                # For false positives, the correct category is background. For retinanet, since no explicit
+                # background category is available, this value is computed as 1.0 - score of the predicted
+                # category.
+                predicted_class_probs, predicted_class_idx = matched_results[matched_results_key]['predicted_cls_probs'].max(
+                    1)
+                #como previamente ja tinha feito uma seleçao das instances com as categorias relevantes, neste passo apenas vamos ter 
+                #as categorias relevantes do yolo!! :)
+                #print(torch.unique(predicted_class_idx))
+                matched_results[matched_results_key]['predicted_score_of_gt_category'] = 1.0 - \
+                    predicted_class_probs
+                matched_results[matched_results_key]['predicted_cat_idxs'] = predicted_class_idx
+        
+        # Load the different detection partitions
+        true_positives = matched_results['true_positives']
+        false_negatives = matched_results['false_negatives']
+        false_positives = matched_results['false_positives']
+
+        # Get the number of elements in each partition
+        num_true_positives = true_positives['predicted_box_means'].shape[0]
+        num_false_negatives = false_negatives['gt_box_means'].shape[0]
+        num_false_positives = false_positives['predicted_box_means'].shape[0]
+
+        per_class_output_list = []
+        meta_catalog = [0,1,2,3,5,7]
+        #print(torch.unique(true_positives['gt_converted_cat_idxs']))
+        #print(torch.unique(false_positives['predicted_cat_idxs']))
+        for class_idx in meta_catalog:
+            #Encontrar os TP e FP para esta classe
+            true_positives_valid_idxs = true_positives['gt_converted_cat_idxs'] == class_idx
+            false_positives_valid_idxs = false_positives['predicted_cat_idxs'] == class_idx
+
+            # Compute classification metrics for every partition
+            true_positives_cls_analysis = new_utils.scoring_rules.compute_cls_scores(
+                true_positives, true_positives_valid_idxs)
+            #alterei a funçao, pois o confidence score que os fp obtem, esta relacionado com o target 0(visto nao haver nada la)
+            #e nao com o target 1
+            false_positives_cls_analysis = new_utils.scoring_rules.compute_cls_scores_fp(
+                false_positives, false_positives_valid_idxs)
+
+            # Compute regression metrics for every partition
+            true_positives_reg_analysis = new_utils.scoring_rules.compute_reg_scores(
+                true_positives, true_positives_valid_idxs)
+            false_positives_reg_analysis = new_utils.scoring_rules.compute_reg_scores_fp(
+                false_positives, false_positives_valid_idxs)
+            #false_positives_reg_analysis = {'ignorance_mean':0}
+
+            per_class_output_list.append(
+                {'true_positives_cls_analysis': true_positives_cls_analysis,
+                    'true_positives_reg_analysis': true_positives_reg_analysis,
+                    'false_positives_cls_analysis': false_positives_cls_analysis,
+                    'false_positives_reg_analysis': false_positives_reg_analysis})
+        
+        final_accumulated_output_dict = dict()
+        final_average_output_dict = dict()
+
+        #visto que ate este ponto temos a analise feita por classe, agora falta fazer a media de todos os valores obtidos.
+        for key in per_class_output_list[0].keys():
+            average_output_dict = dict()
+            for inner_key in per_class_output_list[0][key].keys():
+                collected_values = [per_class_output[key][inner_key]
+                                    for per_class_output in per_class_output_list if per_class_output[key][inner_key] is not None]
+                collected_values = np.array(collected_values)
+
+                if key in average_output_dict.keys():
+                    # Use nan mean since some classes do not have duplicates for
+                    # instance or has one duplicate for instance. torch.std returns nan in that case
+                    # so we handle those here. This should not have any effect on the final results, as
+                    # it only affects inter-class variance which we do not
+                    # report anyways.
+                    average_output_dict[key].update(
+                        {inner_key: np.nanmean(collected_values)})
+                    final_accumulated_output_dict[key].update(
+                        {inner_key: collected_values})
+                else:
+                    average_output_dict.update(
+                        {key: {inner_key: np.nanmean(collected_values)}})
+                    final_accumulated_output_dict.update(
+                        {key: {inner_key: collected_values}})
+
+            final_average_output_dict.update(average_output_dict)
+    table = PrettyTable()
+    table.field_names = (['TP Cls NLL',
+                          'TP Reg NLL',
+                          'TP Reg MSE',
+                          'FP Cls NLL',
+                          'FP Reg Total Entropy Mean'])
+    table.add_row(['{:.4f}'.format(final_average_output_dict['true_positives_cls_analysis']['ignorance_score_mean']),
+                   '{:.4f}'.format(final_average_output_dict['true_positives_reg_analysis']['ignorance_score_mean']),
+                   '{:.4f}'.format(final_average_output_dict['true_positives_reg_analysis']['mean_squared_error']),
+                   '{:.4f}'.format(final_average_output_dict['false_positives_cls_analysis']['ignorance_score_mean']),
+                   '{:.4f}'.format(final_average_output_dict['false_positives_reg_analysis']['total_entropy_mean'])])
+    print(table)
+    return final_average_output_dict, final_accumulated_output_dict
+
+def compute_calibration_uncertainty_errors(matched_results):
+    #As labels da gt sao :                 45,6,1,7,2,3
+    #As previsoes do yolo estao nos lugares 0,1,2,3,5,7
+    #Ao escolher apenas estas vamos para:   0,1,2,3,4,5
+    cat_mapping_dict = {7: 3, 6: 1, 5: 0, 4: 0, 3: 7, 2: 5, 1: 2}
+    with torch.no_grad():
+        # Build preliminary dicts required for computing classification scores.
+        for matched_results_key in matched_results.keys():
+            if 'gt_cat_idxs' in matched_results[matched_results_key].keys():
+                # First we convert the written things indices to contiguous
+                # indices.
+                #Esta secção serve para converter as labels das ground truth do bdd para yolo
+                teste = matched_results[matched_results_key]['gt_cat_idxs']
+                gt_converted_cat_idxs = matched_results[matched_results_key]['gt_cat_idxs'].squeeze(
+                    1)
+                #gt_converted_cat_idxs = matched_results[matched_results_key]['gt_cat_idxs']
+                gt_converted_cat_idxs = torch.as_tensor([cat_mapping_dict[class_idx.cpu(
+                ).tolist()] for class_idx in gt_converted_cat_idxs]).to(device)
+                #convert from 0,1,2,3,5,7 to 0,1,2,3,4,5
+                yolo_to_0_5_dict = {0: 0, 1: 1, 2: 2, 3: 3, 5: 4, 7: 5}
+                gt_converted_cat_idxs = torch.as_tensor([yolo_to_0_5_dict[class_idx.cpu(
+                ).tolist()] for class_idx in gt_converted_cat_idxs]).to(device)
+                matched_results[matched_results_key]['gt_converted_cat_idxs'] = gt_converted_cat_idxs.to(
+                    device)
+                matched_results[matched_results_key]['gt_cat_idxs'] = gt_converted_cat_idxs
+                #print(torch.unique(gt_converted_cat_idxs))
+            if 'predicted_cls_probs' in matched_results[matched_results_key].keys(
+            ):
+                #Nesta secção pretende-se obter a classe prevista (aquela que possui o maior CS) para a bbox
+                #Sera depois utilizado para fazer uma comparaçao com as GT e obter calibration errors
+                #Guarda-se entao o CS score maximo obtido, e a classe correspondente.
+                #Por alguma razão, no codigo original, ele retira a ultima coluna do vetor de probabilidades(motorcycle)
+                #No nosso caso, queremos todas, por isso vamos deixar assim, ja fizemos um pre processemanto que garante todas as categorias relevantes
+                #predicted_class_probs, predicted_cat_idxs = matched_results[
+                #    matched_results_key]['predicted_cls_probs'][:, :-1].max(1)
+                #Vamos fazer uma limpeza aos dados, ficando apenas as 6 categorias relevantes, removendo as outras 74
+                #Esta parte afinal é necessaria porque precisamos disto para calcular os calibration errors, que apenas sao relevantes para estas classes
+                #Neste momento as classes que serão predicted vao do 0 ate ao 5 inclusive
+                #0-person/rider|1-bycicle|2-car|3-motorcycle|4-bus|5-truck
+                matched_results[matched_results_key]['predicted_cls_probs'] = matched_results[matched_results_key]['predicted_cls_probs'][:,[0,1,2,3,5,7]]
+                predicted_class_probs, predicted_cat_idxs = matched_results[
+                    matched_results_key]['predicted_cls_probs'].max(1)
+                #teste_probs, teste_idxs = teste.max(1)
+                #print(torch.unique(predicted_cat_idxs))
+                matched_results[matched_results_key]['predicted_cat_idxs'] = predicted_cat_idxs
+                matched_results[matched_results_key]['output_logits'] = predicted_class_probs
+
+        # Load the different detection partitions
+        true_positives = matched_results['true_positives']
+        duplicates = matched_results['duplicates']
+        false_positives = matched_results['false_positives']
+
+        # Get the number of elements in each partition
+        cls_min_uncertainty_error_list = []
+
+        reg_maximum_calibration_error_list = []
+        reg_expected_calibration_error_list = []
+        reg_min_uncertainty_error_list = []
+
+        all_predicted_scores = torch.cat(
+            (true_positives['predicted_cls_probs'].flatten(),
+             duplicates['predicted_cls_probs'].flatten(),
+             false_positives['predicted_cls_probs'].flatten()),
+            0)
+
+        all_gt_scores = torch.cat(
+            (torch.nn.functional.one_hot(
+                true_positives['gt_cat_idxs'],
+                true_positives['predicted_cls_probs'].shape[1]).flatten().to(device),
+                torch.nn.functional.one_hot(
+                duplicates['gt_cat_idxs'],
+                true_positives['predicted_cls_probs'].shape[1]).flatten().to(device),
+                torch.zeros_like(
+                false_positives['predicted_cls_probs'].type(
+                    torch.LongTensor).flatten()).to(device)),
+            0)
+
+        # Compute classification calibration error using calibration
+        # library
+        #O marginal calibration error é para o caso de multi-classe
+        cls_marginal_calibration_error = cal.get_calibration_error(
+            all_predicted_scores.cpu().numpy(), all_gt_scores.cpu().numpy())
+        
+        #Nesta secção vamos classe a classe calcular regression calibration error, minimum uncertainty error tanto para cls como reg.
+        #No fim, faz-se uma média de todas as classes
+        #for class_idx in cat_mapping_dict.values():
+        for class_idx in [0,1,2,3,4,5]:
+            true_positives_valid_idxs = true_positives['gt_converted_cat_idxs'] == class_idx
+            duplicates_valid_idxs = duplicates['gt_converted_cat_idxs'] == class_idx
+            false_positives_valid_idxs = false_positives['predicted_cat_idxs'] == class_idx
+
+            # For the rest of the code, gt_scores need to be ones or zeros. All
+            # processing is done on a per-class basis
+            #Como estamos a analisar classe a classe, basta ter 1 ou 0, é ou não é.
+            all_gt_scores = torch.cat(
+                (torch.ones_like(
+                    true_positives['gt_converted_cat_idxs'][true_positives_valid_idxs]).to(device),
+                    torch.zeros_like(
+                    duplicates['gt_converted_cat_idxs'][duplicates_valid_idxs]).to(device),
+                    torch.zeros_like(
+                    false_positives['predicted_cat_idxs'][false_positives_valid_idxs]).to(device)),
+                0).type(
+                torch.DoubleTensor)
+
+            # Compute classification minimum uncertainty error
+            #Neste vetor vamos colocar as probabilidades obtidas(CS maximo) para a classe. Essencial para de seguida calcular a entropia
+            distribution_params = torch.cat(
+                (true_positives['output_logits'][true_positives_valid_idxs],
+                 duplicates['output_logits'][duplicates_valid_idxs],
+                 false_positives['output_logits'][false_positives_valid_idxs]),
+                0)
+            #Agora calculamos a entropia, atraves das probabilidades. Cada bbox vai ter a sua entropia associada a classe aqui.
+            all_predicted_cat_entropy = -torch.log(distribution_params)
+            #Returns a random permutation of integers from 0 to n - 1.
+            #Nesta pequena secção ele realiza uma randomização dos valores.
+            #Nao percebo a necessidade disto, ate porque a seguir vamos ordenar por entropia obtida.
+            random_idxs = torch.randperm(all_predicted_cat_entropy.shape[0])
+            all_predicted_cat_entropy = all_predicted_cat_entropy[random_idxs]
+            all_gt_scores_cls = all_gt_scores[random_idxs]
+            #Aqui vamos obter a ordem correta, começando por valores de entropia mais baixos para os maiores.
+            sorted_entropies, sorted_idxs = all_predicted_cat_entropy.sort()
+            #O nosso objetivo é contar quantos TP estao acima de um certo valor de entropia(e dividir pelo numero total de TP e multiplicar por 0.5)
+            #Assim como contar quantos FP estao abaixo de um certo valor de entropia(e dividir pelo numero total de FP e multiplicar por 0.5)
+            #Somando estes dois valores obtemos o uncertainty error.
+            #Criar estes dois vetores "simetricos" da a possibilidade de contar o numero total de TP(basta fazer a soma do vetor, se for tp é 1, 0 otherwise)
+            #Assim como o seu simetro permite a contagem do numero total de FP.
+            sorted_gt_idxs_tp = all_gt_scores_cls[sorted_idxs]
+            sorted_gt_idxs_fp = 1.0 - sorted_gt_idxs_tp
+            #O cumulative sum serve para podermos experimentar todos os possiveis spots de colocar o threshold da entropia!
+            #Começas por colocar apenas o primeiro valor mais pequeno de entropia, e vais subindo, obtens uma matriz com todos os valores de 
+            #uncertainty error para cada possivel threshold. Depois basta procurar qual o valor minimo obtido e esta ai o Minimum Uncertainty Error
+            tp_cum_sum = torch.cumsum(sorted_gt_idxs_tp, 0)
+            fp_cum_sum = torch.cumsum(sorted_gt_idxs_fp, 0)
+            #esta soma representa o numero total de ground truths que existem e por isso
+            #o numero maximo de true positives possivel
+
+            cls_u_errors = 0.5 * (sorted_gt_idxs_tp.sum(0) - tp_cum_sum) / \
+                sorted_gt_idxs_tp.sum(0) + 0.5 * fp_cum_sum / sorted_gt_idxs_fp.sum(0)
+            cls_min_u_error = cls_u_errors.min()
+            cls_min_uncertainty_error_list.append(cls_min_u_error)
+
+            # Compute regression calibration errors. False negatives cant be evaluated since
+            # those do not have ground truth.
+            #Obtemos os dados relevantes para calibration da regressao, medias e matrizes de covariancia(so vamos precisar das variancias)
+            all_predicted_means = torch.cat(
+                (true_positives['predicted_box_means'][true_positives_valid_idxs],
+                 duplicates['predicted_box_means'][duplicates_valid_idxs]),
+                0)
+
+            all_predicted_covariances = torch.cat(
+                (true_positives['predicted_box_covariances'][true_positives_valid_idxs],
+                 duplicates['predicted_box_covariances'][duplicates_valid_idxs]),
+                0)
+
+            all_predicted_gt = torch.cat(
+                (true_positives['gt_box_means'][true_positives_valid_idxs],
+                 duplicates['gt_box_means'][duplicates_valid_idxs]),
+                0)
+            #Aqui retiramos apenas as variancias das 4 variaveis
+            all_predicted_covariances = torch.diagonal(
+                all_predicted_covariances, dim1=1, dim2=2)
+
+            # The assumption of uncorrelated components is not accurate, especially when estimating full
+            # covariance matrices. However, using scipy to compute multivariate cdfs is very very
+            # time consuming for such large amounts of data.
+            reg_maximum_calibration_error = []
+            reg_expected_calibration_error = []
+
+            # Regression calibration is computed for every box dimension
+            # separately, and averaged after.
+            for box_dim in range(all_predicted_gt.shape[1]):
+                #Vamos obter os valores da calibraçao da regressao variavel a variavel da bbox, e apenas no fim se faz a average(tambem estamos a fazer apenas para uma classe)
+                all_predicted_means_current_dim = all_predicted_means[:, box_dim]
+                all_predicted_gt_current_dim = all_predicted_gt[:, box_dim]
+                all_predicted_covariances_current_dim = all_predicted_covariances[:, box_dim]
+                #Aqui criamos distribuiçoes normais para cada prediction usando a media e o desvio padrao(raiz quadrada da variancia)
+                normal_dists = torch.distributions.Normal(
+                    all_predicted_means_current_dim,
+                    scale=torch.sqrt(all_predicted_covariances_current_dim))
+                #Aqui obtemos o valor para a "likelihood" da predictive distribution estimada "explicar" o ground truth
+                #Ou seja, a probabilidade do ground truth pertencer a esta distribution
+                #Obtem se a probabilidade que "the variable will fall into a certain interval that you supply"
+                all_predicted_scores = normal_dists.cdf(
+                    all_predicted_gt_current_dim)
+
+                reg_calibration_error = []
+                histogram_bin_step_size = 1 / 15.0
+                for i in torch.arange(
+                        0.0,
+                        1.0 - histogram_bin_step_size,
+                        histogram_bin_step_size):
+                    # Get number of elements in bin
+                    #Aqui vamos criar varios bins para colocar as diferentes previsoes, para cada bin vamos fazer um calculo de quantas previsoes
+                    #possuem um score/probabilidade abaixo daquele certo valor
+                    #Com esse numero e dividindo pelo numero total de previsoes, conseguimos saber a "accuracy" obtida e podemos comparar com 
+                    #a probabilidade expectada que é o valor maximo de confidence do bin. 
+                    #Depois para calcular a calibration fazemos a diferença entre esses dois valores e elevamos ao quadrado.
+                    #Por fim temos de fazer uma media para todos os bins obtidos, e ficamos assim com uma Expected calibration error
+                    #E tambem obtemos a maximum claibration error. Nao esquecer que isto apenas representa uma das variaveis.
+                    #É necessario fazer isto para todas as variaveis, depois fazer a media. Mesmo assim, apenas representa uma classe, fazer a media entre classes
+                    elements_in_bin = (
+                        all_predicted_scores < (i + histogram_bin_step_size))
+                    num_elems_in_bin_i = elements_in_bin.type(
+                        torch.FloatTensor).to(device).sum()
+
+                    # Compute calibration error from "Accurate uncertainties for deep
+                    # learning using calibrated regression" paper.
+                    #teste = ((num_elems_in_bin_i / all_predicted_scores.shape[0]) - (i + histogram_bin_step_size)) ** 2
+                    #igual = num_elems_in_bin_i / all_predicted_scores.shape[0]
+                    #igual = (igual - (i + histogram_bin_step_size)) ** 2
+                    #teste = (i + histogram_bin_step_size)
+                    #teste = num_elems_in_bin_i / all_predicted_scores.shape[0] - (i + histogram_bin_step_size)
+                    reg_calibration_error.append(
+                        (num_elems_in_bin_i / all_predicted_scores.shape[0] - (i + histogram_bin_step_size)) ** 2)
+
+                calibration_error = torch.stack(
+                    reg_calibration_error).to(device)
+                reg_maximum_calibration_error.append(calibration_error.max())
+                reg_expected_calibration_error.append(calibration_error.mean())
+
+            reg_maximum_calibration_error_list.append(
+                reg_maximum_calibration_error)
+            reg_expected_calibration_error_list.append(
+                reg_expected_calibration_error)
+
+            # Compute regression minimum uncertainty error
+            #É completamente similar a minimum uncertainty error para a classificação
+            #A diferença é que neste caso para obtermos os valores de entropia tem que ser atraves de distribuiçoes multivariadas
+            #cuidado, é possivel termos de multiplicar por fatores para garantir positive definite matrices.
+            all_predicted_covars = torch.cat(
+                (true_positives['predicted_box_covariances'][true_positives_valid_idxs],
+                 duplicates['predicted_box_covariances'][duplicates_valid_idxs],
+                 false_positives['predicted_box_covariances'][false_positives_valid_idxs]),
+                0)
+
+            #Code(3 lines) that guarantee matrices to be positive definite
+            diag_up = torch.triu(all_predicted_covars)
+            upper = torch.triu(all_predicted_covars,diagonal=1)
+            all_predicted_covars = torch.transpose(diag_up,1,2) + upper
+            
+            #count = 0
+            #for i , cov_matrix in enumerate(all_predicted_covars):
+            #    cov_matrix_np = cov_matrix.cpu().numpy()        
+            #    if not is_pos_def(cov_matrix):
+            #        print(i)
+            #        count += 1
+            #        print(count)
+            #        #teste = np.linalg.eigvals(cov_matrix_np)
+            #        #temp = np.all(teste > 0)
+            #        #if np.array_equal(A, A.T):
+            #        if  torch.allclose(cov_matrix, cov_matrix.T):
+            #            try:
+            #                np.linalg.cholesky(cov_matrix_np.astype('float64'))
+            #            except np.linalg.LinAlgError:
+            #                print('É SIMETRICA, MAS NAO DA O CHOLESKY')
+            #        else:
+            #            print('NAO É SIMETRICA')         
+               
+            all_predicted_distributions = torch.distributions.multivariate_normal.MultivariateNormal(torch.zeros(
+                all_predicted_covars.shape[0:2]).to(device), all_predicted_covars + 1e-4 * torch.eye(all_predicted_covars.shape[2]).to(device))
+
+            all_predicted_reg_entropy = all_predicted_distributions.entropy()
+            random_idxs = torch.randperm(all_predicted_reg_entropy.shape[0])
+
+            all_predicted_reg_entropy = all_predicted_reg_entropy[random_idxs]
+            all_gt_scores_reg = all_gt_scores[random_idxs]
+
+            sorted_entropies, sorted_idxs = all_predicted_reg_entropy.sort()
+            sorted_gt_idxs_tp = all_gt_scores_reg[sorted_idxs]
+            sorted_gt_idxs_fp = 1.0 - sorted_gt_idxs_tp
+
+            tp_cum_sum = torch.cumsum(sorted_gt_idxs_tp, 0)
+            fp_cum_sum = torch.cumsum(sorted_gt_idxs_fp, 0)
+            reg_u_errors = 0.5 * ((sorted_gt_idxs_tp.sum(0) - tp_cum_sum) /
+                                  sorted_gt_idxs_tp.sum(0)) + 0.5 * (fp_cum_sum / sorted_gt_idxs_fp.sum(0))
+            reg_min_u_error = reg_u_errors.min()
+            reg_min_uncertainty_error_list.append(reg_min_u_error)
+            # Summarize and print all
+        table = PrettyTable()
+        table.field_names = (['Cls Marginal CE',
+                              'Reg Expected CE',
+                              'Reg Maximum CE',
+                              'Cls MUE',
+                              'Reg MUE'])
+
+        reg_expected_calibration_error = torch.stack([torch.stack(
+            reg, 0) for reg in reg_expected_calibration_error_list], 0)
+        reg_expected_calibration_error = reg_expected_calibration_error[
+            ~torch.isnan(reg_expected_calibration_error)].mean()
+
+        reg_maximum_calibration_error = torch.stack([torch.stack(
+            reg, 0) for reg in reg_maximum_calibration_error_list], 0)
+        reg_maximum_calibration_error = reg_maximum_calibration_error[
+            ~torch.isnan(reg_maximum_calibration_error)].mean()
+
+        cls_min_u_error = torch.stack(cls_min_uncertainty_error_list, 0)
+        cls_min_u_error = cls_min_u_error[
+            ~torch.isnan(cls_min_u_error)].mean()
+
+        reg_min_u_error = torch.stack(reg_min_uncertainty_error_list, 0)
+        reg_min_u_error = reg_min_u_error[
+            ~torch.isnan(reg_min_u_error)].mean()
+
+        table.add_row(['{:.4f}'.format(cls_marginal_calibration_error),
+                       '{:.4f}'.format(reg_expected_calibration_error.cpu().numpy().tolist()),
+                       '{:.4f}'.format(reg_maximum_calibration_error.cpu().numpy().tolist()),
+                       '{:.4f}'.format(cls_min_u_error.cpu().numpy().tolist()),
+                       '{:.4f}'.format(reg_min_u_error.cpu().numpy().tolist())])
+        print(table)
+        final_results_calibration = {"cls_marginal_cal_error":cls_marginal_calibration_error,
+                                     "reg_expected_cal_error":reg_expected_calibration_error,
+                                     "reg_max_cal_error":reg_maximum_calibration_error,
+                                     "cls_min_u_error":cls_min_u_error,
+                                     "reg_min_u_error":reg_min_u_error}
+
+    return final_results_calibration
+
+def compute_average_precision(path_to_results,path_to_dataset):
+
+    # Build path to inference output
+    inference_output_dir = path_to_results
+
+    prediction_file_name = os.path.join(
+        inference_output_dir,
+        'coco_instances_results.json')
+
+    #meta_catalog = MetadataCatalog.get(args.test_dataset)
+    meta_catalog_json_file = os.path.join(path_to_dataset,'val_coco_format.json') 
+    # Evaluate detection results
+    #gt_coco_api = COCO(meta_catalog.json_file)
+    gt_coco_api = COCO(meta_catalog_json_file)
+    res_coco_api = gt_coco_api.loadRes(prediction_file_name)
+    results_api = COCOeval(gt_coco_api, res_coco_api, iouType='bbox')
+    
+    #Use this for mAP only with "car" and "person" as categories (for dataset shift mAP)
+    results_api.params.catIds = [1,2,3,4,5,6,7] #This only works for BDD!!! For kitti dataset, you should use either the list or [1,2]
+    
+    #Use this for standard mAP across all existing categories
+    #results_api.params.catIds = list(meta_catalog.thing_dataset_id_to_contiguous_id.keys())
+    #print(meta_catalog)
+    #print(results_api.params.catIds)
+    
+    # Calculate and print aggregate results
+    results_api.evaluate()
+    results_api.accumulate()
+    results_api.summarize()
+
+    # Compute optimal micro F1 score threshold. We compute the f1 score for
+    # every class and score threshold. We then compute the score threshold that
+    # maximizes the F-1 score of every class. The final score threshold is the average
+    # over all classes.
+    precisions = results_api.eval['precision'].mean(0)[:, :, 0, 2]
+    recalls = np.expand_dims(results_api.params.recThrs, 1)
+    f1_scores = 2*(precisions * recalls) / (precisions + recalls)
+    optimal_f1_score = f1_scores.argmax(0)
+    scores = results_api.eval['scores'].mean(0)[:, :, 0, 2]
+    optimal_score_threshold = [scores[optimal_f1_score_i, i] for i, optimal_f1_score_i in enumerate(optimal_f1_score)]
+    optimal_score_threshold = np.array(optimal_score_threshold)
+    optimal_score_threshold = optimal_score_threshold[optimal_score_threshold != 0]
+    optimal_score_threshold = optimal_score_threshold.mean()
+
+    print("Classification Score at Optimal F-1 Score: {}".format(optimal_score_threshold))
+
+    text_file_name = os.path.join(
+        inference_output_dir,
+        'mAP_res.txt')
+
+    with open(text_file_name, "w") as text_file:
+        print(results_api.stats.tolist() +
+              [optimal_score_threshold, ], file=text_file)
+
+    return results_api.stats.tolist(), optimal_score_threshold
