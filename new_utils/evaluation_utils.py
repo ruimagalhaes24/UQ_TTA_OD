@@ -82,7 +82,7 @@ def get_preprocess_pred_instances(path_to_predictions_file):
     except FileNotFoundError:
 
         predicted_instances = json.load(
-            open(os.path.join(path_to_predictions_file, 'coco_instances_results.json'), "r")
+            open(os.path.join(path_to_predictions_file, 'coco_instances_results_xyxy.json'), "r")
             ) 
 
         predicted_boxes, predicted_cls_probs, predicted_covar_mats = defaultdict(torch.Tensor), defaultdict(torch.Tensor), defaultdict(torch.Tensor)
@@ -106,10 +106,11 @@ def get_preprocess_pred_instances(path_to_predictions_file):
 
             box_inds = predicted_instance['bbox']
             #from top left corner,w,h to top left corner bottom right corner
-            box_inds = np.array([box_inds[0],
-                                 box_inds[1],
-                                 box_inds[0] + box_inds[2],
-                                 box_inds[1] + box_inds[3]])
+            #box_inds = np.array([box_inds[0],
+            #                     box_inds[1],
+            #                     box_inds[0] + box_inds[2],
+            #                     box_inds[1] + box_inds[3]])
+            box_inds = np.array(box_inds)
 
             predicted_boxes[predicted_instance['image_id']] = torch.cat((predicted_boxes[predicted_instance['image_id']].to(
                 device), torch.as_tensor([box_inds], dtype=torch.float32).to(device)))
@@ -119,16 +120,16 @@ def get_preprocess_pred_instances(path_to_predictions_file):
 
             #Converts covariance matrices from top-left corner and width-height representation to top-left bottom-right corner representation
             box_covar = np.array(predicted_instance['bbox_covar'])
-            transformation_mat = np.array([[1.0, 0  , 0  , 0  ],
-                                           [0  , 1.0, 0  , 0  ],
-                                           [1.0, 0  , 1.0, 0  ],
-                                           [0  , 1.0, 0.0, 1.0]])
-            cov_pred = np.matmul(
-                np.matmul(
-                    transformation_mat,
-                    box_covar),
-                transformation_mat.T).tolist()
-            #cov_pred = box_covar
+            #transformation_mat = np.array([[1.0, 0  , 0  , 0  ],
+            #                               [0  , 1.0, 0  , 0  ],
+            #                               [1.0, 0  , 1.0, 0  ],
+            #                               [0  , 1.0, 0.0, 1.0]])
+            #cov_pred = np.matmul(
+            #    np.matmul(
+            #        transformation_mat,
+            #        box_covar),
+            #    transformation_mat.T).tolist()
+            cov_pred = box_covar
             predicted_covar_mats[predicted_instance['image_id']] = torch.cat(
                 (predicted_covar_mats[predicted_instance['image_id']].to(device), torch.as_tensor([cov_pred], dtype=torch.float32).to(device)))
 
@@ -377,22 +378,26 @@ def get_matched_results(path_to_results, preprocessed_gt_instances, preprocessed
 
         return matched_results
 
-def compute_nll(matched_results_):
+def compute_nll(matched_results_,kitti = False):
     #Category mapping YOLO to BDD
     #cat_mapping_dict = {2: 1, 5: 2, 7: 3, 0: 4, 1: 6, 3: 7}
     #É preciso ter em atençao que nas ground truths a categoria "rider" nao existe no yolo. sera que devia entao de tirá-la das gt???
     #Ja reparei em algumas imagens que ele classifica o rider como sendo "person". Outra opçao tambem poderia ser colocar a label como "motorcycle"
     #aqui vou ter que colocar o equivalente da label no vetor de 80 classes do yolo
-    #YOLO | BDD
-    #2 car | 1 car
-    #5 bus | 2 bus
-    #7 truck| 3 truck
-    #0 person| 4 person
-    #-1 rider| 5 rider
-    #1 bycicle | 6 bike 
-    #3 motorcycle | 7 motor
+    #YOLO | BDD | kitti
+    #2 car | 1 car | 1 car
+    #5 bus | 2 bus | ----
+    #7 truck| 3 truck | 2 truck
+    #0 person| 4 person | 3 person
+    #-1 rider| 5 rider | 4 rider
+    #1 bycicle | 6 bike | 5 bycicle
+    #3 motorcycle | 7 motor | ---
+
     matched_results = copy.deepcopy(matched_results_)
-    cat_mapping_dict = {7: 3, 6: 1, 5: 0, 4: 0, 3: 7, 2: 5, 1: 2}
+    if kitti:
+        cat_mapping_dict = {5: 1, 4: 0, 3: 0, 2: 7, 1: 2}
+    else:
+        cat_mapping_dict = {7: 3, 6: 1, 5: 0, 4: 0, 3: 7, 2: 5, 1: 2}
     #cat_mapping_dict = {1:1,2:2,3:3,4:4,5:5,6:6,7:7}
     with torch.no_grad():
         # Build preliminary dicts required for computing classification scores.
@@ -445,7 +450,10 @@ def compute_nll(matched_results_):
         num_false_positives = false_positives['predicted_box_means'].shape[0]
 
         per_class_output_list = []
-        meta_catalog = [0,1,2,3,5,7]
+        if kitti:
+            meta_catalog = [0,1,2,7]
+        else:    
+            meta_catalog = [0,1,2,3,5,7]
         #print(torch.unique(true_positives['gt_converted_cat_idxs']))
         #print(torch.unique(false_positives['predicted_cat_idxs']))
         for class_idx in meta_catalog:
@@ -514,13 +522,57 @@ def compute_nll(matched_results_):
                    '{:.4f}'.format(final_average_output_dict['false_positives_cls_analysis']['ignorance_score_mean']),
                    '{:.4f}'.format(final_average_output_dict['false_positives_reg_analysis']['total_entropy_mean'])])
     print(table)
+    table = PrettyTable()
+    table.field_names = (['Output Type',
+                              'Number of Instances',
+                              'Cls Ignorance Score',
+                              'Reg Ignorance Score'])
+    table.add_row(
+            [
+                "True Positives:",
+                num_true_positives,
+                '{:.4f}'.format(
+                    final_average_output_dict['true_positives_cls_analysis']['ignorance_score_mean']),
+                '{:.4f}'.format(
+                    final_average_output_dict['true_positives_reg_analysis']['ignorance_score_mean'])])
+
+    table.add_row(
+            [
+                "False Positives:",
+                num_false_positives,
+                '{:.4f}'.format(
+                    final_average_output_dict['false_positives_cls_analysis']['ignorance_score_mean']),
+                '{:.4f}'.format(
+                    final_average_output_dict['false_positives_reg_analysis']['total_entropy_mean'])])
+
+    table.add_row(["False Negatives:",
+                       num_false_negatives,
+                       '-',
+                       '-'])
+    print(table)
     return final_average_output_dict, final_accumulated_output_dict
 
-def compute_calibration_uncertainty_errors(matched_results):
+def compute_calibration_uncertainty_errors(matched_results,kitti):
+    #YOLO | BDD | kitti
+    #2 car | 1 car | 1 car
+    #5 bus | 2 bus | ----
+    #7 truck| 3 truck | 2 truck
+    #0 person| 4 person | 3 person
+    #-1 rider| 5 rider | 4 rider
+    #1 bycicle | 6 bike | 5 bycicle
+    #3 motorcycle | 7 motor | ---
+
     #As labels da gt sao :                 45,6,1,7,2,3
     #As previsoes do yolo estao nos lugares 0,1,2,3,5,7
-    #Ao escolher apenas estas vamos para:   0,1,2,3,4,5
-    cat_mapping_dict = {7: 3, 6: 1, 5: 0, 4: 0, 3: 7, 2: 5, 1: 2}
+    #Ao escolher apenas estas vamos para:   0,1,2,3,4,5 BDD
+
+    #PAra o kitti as labels da gt sao :    34,5,1,2
+    #As previsoes do yolo estao nos lugares 0,1,2,7
+    #Ao escolher apenas estas vamos para:   0,1,2,3
+    if kitti:
+        cat_mapping_dict = {5: 1, 4: 0, 3: 0, 2: 7, 1: 2}
+    else:
+        cat_mapping_dict = {7: 3, 6: 1, 5: 0, 4: 0, 3: 7, 2: 5, 1: 2}
     with torch.no_grad():
         # Build preliminary dicts required for computing classification scores.
         for matched_results_key in matched_results.keys():
@@ -535,7 +587,10 @@ def compute_calibration_uncertainty_errors(matched_results):
                 gt_converted_cat_idxs = torch.as_tensor([cat_mapping_dict[class_idx.cpu(
                 ).tolist()] for class_idx in gt_converted_cat_idxs]).to(device)
                 #convert from 0,1,2,3,5,7 to 0,1,2,3,4,5
-                yolo_to_0_5_dict = {0: 0, 1: 1, 2: 2, 3: 3, 5: 4, 7: 5}
+                if kitti: #convert from 0,1,2,7 to 0,1,2,3
+                    yolo_to_0_5_dict = {0: 0, 1: 1, 2: 2, 7: 3}
+                else: #convert from 0,1,2,3,5,7 to 0,1,2,3,4,5
+                    yolo_to_0_5_dict = {0: 0, 1: 1, 2: 2, 3: 3, 5: 4, 7: 5}
                 gt_converted_cat_idxs = torch.as_tensor([yolo_to_0_5_dict[class_idx.cpu(
                 ).tolist()] for class_idx in gt_converted_cat_idxs]).to(device)
                 matched_results[matched_results_key]['gt_converted_cat_idxs'] = gt_converted_cat_idxs.to(
@@ -602,7 +657,12 @@ def compute_calibration_uncertainty_errors(matched_results):
         #Nesta secção vamos classe a classe calcular regression calibration error, minimum uncertainty error tanto para cls como reg.
         #No fim, faz-se uma média de todas as classes
         #for class_idx in cat_mapping_dict.values():
-        for class_idx in [0,1,2,3,4,5]:
+        if kitti:
+            categories_list = [0,1,2,3]
+        else:
+            categories_list = [0,1,2,3,4,5]
+
+        for class_idx in categories_list:
             true_positives_valid_idxs = true_positives['gt_converted_cat_idxs'] == class_idx
             duplicates_valid_idxs = duplicates['gt_converted_cat_idxs'] == class_idx
             false_positives_valid_idxs = false_positives['predicted_cat_idxs'] == class_idx
@@ -833,14 +893,14 @@ def compute_calibration_uncertainty_errors(matched_results):
 
     return final_results_calibration
 
-def compute_average_precision(path_to_results,path_to_dataset):
+def compute_average_precision(path_to_results,path_to_dataset,kitti = False):
 
     # Build path to inference output
     inference_output_dir = path_to_results
 
     prediction_file_name = os.path.join(
         inference_output_dir,
-        'coco_instances_results.json')
+        'coco_instances_results_xywh.json')
 
     #meta_catalog = MetadataCatalog.get(args.test_dataset)
     meta_catalog_json_file = os.path.join(path_to_dataset,'val_coco_format.json') 
@@ -851,7 +911,23 @@ def compute_average_precision(path_to_results,path_to_dataset):
     results_api = COCOeval(gt_coco_api, res_coco_api, iouType='bbox')
     
     #Use this for mAP only with "car" and "person" as categories (for dataset shift mAP)
-    results_api.params.catIds = [1,2,3,4,5,6,7] #This only works for BDD!!! For kitti dataset, you should use either the list or [1,2]
+    #Eu retirei as labels dos "riders" aqui, pois nao da para simplesmente os colocar como se fossem da classe "person"
+    #Problema atual: como eu nas deteçoes ponho tudo junto, vai haver riders que sao considerados persons e vao dar como falso positivos quando
+    #eu nao considero os riders. Se eu considerar os riders tambem dao como falsos positivos pois a classe vai estar errada
+    #Caso queira incluir a unica soluçao seria: alterar as gt em si na sua geraçao, transformando os riders em persons
+    
+    #YOLO | BDD | Kitti
+    #2 car | 1 car | 1 car
+    #5 bus | 2 bus | ----
+    #7 truck| 3 truck | 2 truck
+    #0 person| 4 person | 3 person
+    #-1 rider| 5 rider | 4 rider
+    #1 bycicle | 6 bike | 5 bycicle
+    #3 motorcycle | 7 motor -----
+    if kitti:
+        results_api.params.catIds = [1,2,3,5] 
+    else:
+        results_api.params.catIds = [1,2,3,4,6,7] #This only works for BDD!!! For kitti dataset, you should use either the list or [1,2]
     
     #Use this for standard mAP across all existing categories
     #results_api.params.catIds = list(meta_catalog.thing_dataset_id_to_contiguous_id.keys())

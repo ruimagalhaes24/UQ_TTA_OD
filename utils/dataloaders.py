@@ -30,7 +30,7 @@ from utils.augmentations import Albumentations, augment_hsv, copy_paste, letterb
 from utils.general import (DATASETS_DIR, LOGGER, NUM_THREADS, check_dataset, check_requirements, check_yaml, clean_str,
                            cv2, is_colab, is_kaggle, segments2boxes, xyn2xy, xywh2xyxy, xywhn2xyxy, xyxy2xywhn)
 from utils.torch_utils import torch_distributed_zero_first
-
+from torchvision import transforms
 # Parameters
 HELP_URL = 'https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data'
 IMG_FORMATS = 'bmp', 'dng', 'jpeg', 'jpg', 'mpo', 'png', 'tif', 'tiff', 'webp'  # include image suffixes
@@ -175,7 +175,7 @@ class _RepeatSampler:
 
 class LoadImages:
     # YOLOv5 image/video dataloader, i.e. `python detect.py --source image.jpg/vid.mp4`
-    def __init__(self, path, img_size=640, stride=32, auto=True):
+    def __init__(self, path, img_size=640, stride=32, auto=True, test_time_augmentation=False):
         files = []
         for p in sorted(path) if isinstance(path, (list, tuple)) else [path]:
             p = str(Path(p).resolve())
@@ -199,6 +199,8 @@ class LoadImages:
         self.video_flag = [False] * ni + [True] * nv
         self.mode = 'image'
         self.auto = auto
+
+        self.test_time_augmentation = test_time_augmentation
         if any(videos):
             self.new_video(videos[0])  # new video
         else:
@@ -237,13 +239,16 @@ class LoadImages:
             img0 = cv2.imread(path)  # BGR
             assert img0 is not None, f'Image Not Found {path}'
             s = f'image {self.count}/{self.nf} {path}: '
+        
+        img = torch.tensor([])
 
-        # Padded resize
-        img = letterbox(img0, self.img_size, stride=self.stride, auto=self.auto)[0]
+        if not self.test_time_augmentation:
+            # Padded resize
+            img = letterbox(img0, self.img_size, stride=self.stride, auto=self.auto)[0]
 
-        # Convert
-        img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
-        img = np.ascontiguousarray(img)
+            # Convert
+            img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+            img = np.ascontiguousarray(img)
 
         return path, img, img0, self.cap, s
 

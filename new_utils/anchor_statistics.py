@@ -22,11 +22,11 @@ def pre_processing_anchor_stats(pred_,max_number_bboxes = 20000):
     #Choose only the bbox predictions that assume the presence of an object
     #This is relevant because the training of the network disregards optimization of the bbox coordinates if there isn't an object present.
     #THE FIFTH VALUE IS THE 0/1 PRESENCE OR NOT OF AN OBJECT
-    presence_of_object = torch.squeeze(pred_,dim=0)[:,4:5]
+    presence_of_object = pred_[:,4:5]
     #obtain list with only predicted boxes and its coordinates. Also only the ones where there is the possibility of an object
-    predicted_boxes = torch.squeeze(pred_,dim=0)[:,0:4]
+    predicted_boxes = pred_[:,0:4]
     #obtain list with the probability scores for each class for each bbox
-    predicted_prob_vectors = torch.squeeze(pred_,dim=0)[:,5:]
+    predicted_prob_vectors = pred_[:,5:]
     #Here itry the confidence score of yolo: objecteness_Score*class_score!
     #x[:, 5:] *= x[:, 4:5]
     predicted_prob_vectors *= presence_of_object
@@ -144,7 +144,7 @@ def altered_yolo_nms(prediction,
         output[xi] = x[i]
     return final_indices, output
 
-def compute_anchor_statistics(outputs, device, image_size, original_predictions_yolo,
+def compute_anchor_statistics(outputs, device, image_size, original_predictions_yolo, remove_uncertain_detections,
                                 nms_threshold = 0.5, max_detections_per_image = 100,affinity_threshold = 0.95):
         
     predicted_boxes, predicted_boxes_covariance, predicted_prob, classes_idxs, predicted_prob_vectors = outputs
@@ -166,7 +166,8 @@ def compute_anchor_statistics(outputs, device, image_size, original_predictions_
     agnostic_nms = False
     max_det = 1000
     keep, output = altered_yolo_nms(original_predictions_yolo, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
-
+    #Limit the number of possible detections/cluster centers per image (essencial for mc dropout?)
+    keep = keep[:max_detections_per_image]
     #for i in range(81):
     #    print(predicted_prob_vectors[0][i])
     # Get pairwise iou matrix
@@ -209,10 +210,6 @@ def compute_anchor_statistics(outputs, device, image_size, original_predictions_
             residuals = (box_cluster - cluster_mean).unsqueeze(2)
             #residuals para o calculo da variancia (valor do ponto- media)
             #formula da matriz da covariancia
-            denominador = max((box_cluster.shape[0] - 1), 1.0)
-            numerador = torch.transpose(residuals, 2, 1)
-            numerador = torch.matmul(residuals, torch.transpose(residuals, 2, 1))
-            numerador = torch.sum(torch.matmul(residuals, torch.transpose(residuals, 2, 1)), 0)
             cluster_covariance = torch.sum(torch.matmul(residuals, torch.transpose(
                 residuals, 2, 1)), 0) / max((box_cluster.shape[0] - 1), 1.0)
 
@@ -233,23 +230,21 @@ def compute_anchor_statistics(outputs, device, image_size, original_predictions_
             if predicted_boxes_covariance is not None:
                 if len(predicted_boxes_covariance) > 0:
                     cluster_covariance = predicted_boxes_covariance[center_idx]
-        #################
-        #Test positive definite
-        teste1 = cluster_covariance + 1e-4 * torch.eye(4).to(device)
-        cov_matrix_np = cluster_covariance.cpu().numpy()        
-        teste = cov_matrix_np + (1e-4 * np.eye(4))
-        if not is_pos_def(cluster_covariance + 1e-4 * torch.eye(4).to(device)):
-            if  torch.allclose(cluster_covariance + 1e-4 * torch.eye(4).to(device), (cluster_covariance+ 1e-4 * torch.eye(4).to(device)).T):
-                try:
-                    np.linalg.cholesky(cov_matrix_np + 1e-4 * np.eye(4))
-                except np.linalg.LinAlgError:
-                    print('É SIMETRICA, MAS NAO DA O CHOLESKY')
-            else:
-                print('NAO É SIMETRICA')
-        #########################
-        predicted_boxes_list.append(cluster_mean) #lista que vai conter a media de cada cluster 
-        predicted_boxes_covariance_list.append(cluster_covariance) #lista que vai conter a cov de cada cluster
-        predicted_prob_vectors_list.append(cluster_probs_vector) #list que vai conter a media das classes de cada cluster
+        #Add condition to remove uncertain detections
+        #verifica se ha variancias negativas (tem de ser todas positivas para o cholesky!!!)
+        if torch.sum(torch.diagonal(cluster_covariance) < 0) > 0:
+            print('ha pelo menos uma variancia negativa!!!!!')
+        total_variance = torch.sum(torch.diagonal(cluster_covariance)) #33
+        generalized_variance = torch.det(cluster_covariance) #2500
+        shannon_entropy_dist = torch.distributions.categorical.Categorical(cluster_probs_vector)
+        shannon_entropy = shannon_entropy_dist.entropy()
+        #What about using the median value insted of the mean
+        if not (remove_uncertain_detections and ((total_variance > 33) or (shannon_entropy > 0.95))):
+            predicted_boxes_list.append(cluster_mean) #lista que vai conter a media de cada cluster 
+            predicted_boxes_covariance_list.append(cluster_covariance) #lista que vai conter a cov de cada cluster
+            predicted_prob_vectors_list.append(cluster_probs_vector) #list que vai conter a media das classes de cada cluster
+        else:
+            print('nao adicionei o cluster')
         
     result = Instances((image_size.shape[0],image_size.shape[1]))
 
@@ -306,8 +301,8 @@ def probabilistic_detector_postprocessing(outputs, image_size):
 
     output_boxes = outputs.pred_boxes
     # Scale bounding boxes
-    output_boxes.scale(scale_x, scale_y)
-    output_boxes.clip(outputs.image_size)
+    #output_boxes.scale(scale_x, scale_y)
+    #output_boxes.clip(outputs.image_size)
     #ATENÇAO ESTE .NONEMPTY FAZ COM QUE APENAS SOBREM 2 BBOXES FOR SOME REASON
     #non empty method faz xmax - xmin e ymax - ymin. se estas distancias
     #forem maior que 0, entao existe caixa.
@@ -319,19 +314,19 @@ def probabilistic_detector_postprocessing(outputs, image_size):
         # Add small value to make sure covariance matrix is well conditioned
         output_boxes_covariance = outputs.pred_boxes_covariance + 1e-4 * torch.eye(outputs.pred_boxes_covariance.shape[2]).to(device)
 
-        scale_mat = torch.diag_embed(
-            torch.as_tensor(
-                (scale_x,
-                 scale_y,
-                 scale_x,
-                 scale_y))).to(device).unsqueeze(0)
-        scale_mat = torch.repeat_interleave(
-            scale_mat, output_boxes_covariance.shape[0], 0)
-        output_boxes_covariance = torch.matmul(
-            torch.matmul(
-                scale_mat,
-                output_boxes_covariance),
-            torch.transpose(scale_mat, 2, 1))
+        #scale_mat = torch.diag_embed(
+        #    torch.as_tensor(
+        #        (scale_x,
+        #         scale_y,
+        #         scale_x,
+        #         scale_y))).to(device).unsqueeze(0)
+        #scale_mat = torch.repeat_interleave(
+        #    scale_mat, output_boxes_covariance.shape[0], 0)
+        #output_boxes_covariance = torch.matmul(
+        #    torch.matmul(
+        #        scale_mat,
+        #        output_boxes_covariance),
+        #    torch.transpose(scale_mat, 2, 1))
         outputs.pred_boxes_covariance = output_boxes_covariance
     return outputs
 
@@ -360,7 +355,7 @@ def covar_xyxy_to_xywh(output_boxes_covariance):
 
     return output_boxes_covariance
 
-def instances_to_json(instances,img_id):
+def instances_to_json(instances,img_id,kitti):
     """
     Dump an "Instances" object to a COCO-format json that's used for evaluation.
 
@@ -375,7 +370,7 @@ def instances_to_json(instances,img_id):
     """
     num_instance = len(instances)
     if num_instance == 0:
-        return []
+        return [] , []
     #FOR BDD ISTO ESTA ERRADO, TENHO DE FAZER A CONVERSAO
     #YOLO PARA BDD? ver classes do coco no coco.yaml
     #YOLO: 0: Person; 1: Bycicle, 2: Car    
@@ -391,24 +386,35 @@ def instances_to_json(instances,img_id):
     #              {'id': 6, 'name': 'bike', 'supercategory': 'vehicle'},
     #              {'id': 7, 'name': 'motor', 'supercategory': 'vehicle'}
     #              ]
-    #YOLO | BDD
-    #2 car | 1 car
-    #5 bus | 2 bus
-    #7 truck| 3 truck
-    #0 person| 4 person
-    #-1 rider| 5 rider
-    #1 bycicle | 6 bike 
-    #3 motorcycle | 7 motor
+    #    categories = [{'id': 1, 'name': 'car', 'supercategory': 'vehicle'},
+    #              {'id': 2, 'name': 'truck', 'supercategory': 'vehicle'},
+    #              {'id': 3, 'name': 'person', 'supercategory': 'person'},
+    #              {'id': 4, 'name': 'rider', 'supercategory': 'vehicle'},
+    #              {'id': 5, 'name': 'bike', 'supercategory': 'vehicle'}]
+    #YOLO | BDD | Kitti
+    #2 car | 1 car | 1 car
+    #5 bus | 2 bus | ----
+    #7 truck| 3 truck | 2 truck
+    #0 person| 4 person | 3 person
+    #-1 rider| 5 rider | 4 rider
+    #1 bycicle | 6 bike | 5 bycicle
+    #3 motorcycle | 7 motor -----
     
     #IMPORTANTE, ESTOU A FICAR COM POUCAS BBOXES FINAIS (13 DE 100 NA PRIMEIRA IMAGEM)
     #ISTO ACONTECE PORQUE GRANDE PARTE DAS PREVISOES SAO DE OUTRAS CLASSES (STREET LIGHTS, SIGNS,ETC)
     #PODE SER RELEVANTE FAZER UM PRE PROCESSAMENTO ONDE NA PARTE DA OUTPUT REDUNDANCY SO ESCOLHO
     #AS 100 MELHORES BBOXES DAS CLASSES QUE ME INTERESSAM!!!
-    cat_mapping_dict = {2: 1, 5: 2, 7: 3, 0: 4, 1: 6, 3: 7}
+    #kitti = True
+    if kitti:
+        cat_mapping_dict = {2: 1, 7: 2, 0: 3, 1: 5}
+    else:
+        cat_mapping_dict = {2: 1, 5: 2, 7: 3, 0: 4, 1: 6, 3: 7}
+    
 
-    boxes = instances.pred_boxes.tensor.cpu().numpy()
-    boxes = BoxMode.convert(boxes, BoxMode.XYXY_ABS, BoxMode.XYWH_ABS)
-    boxes = boxes.tolist()
+    boxes_xyxy = instances.pred_boxes.tensor.cpu().numpy()
+    boxes_xywh = BoxMode.convert(boxes_xyxy, BoxMode.XYXY_ABS, BoxMode.XYWH_ABS)
+    boxes_xyxy = boxes_xyxy.tolist()
+    boxes_xywh = boxes_xywh.tolist()
     scores = instances.scores.cpu().tolist()
     classes = instances.pred_classes.cpu().tolist()
 
@@ -419,22 +425,77 @@ def instances_to_json(instances,img_id):
     pred_cls_probs = instances.pred_cls_probs.cpu().tolist()
 
     if instances.has("pred_boxes_covariance"):
-        pred_boxes_covariance = covar_xyxy_to_xywh(
-            instances.pred_boxes_covariance).cpu().tolist()
+        pred_boxes_covariance = instances.pred_boxes_covariance
+        #Code(3 lines) that guarantee matrices to be positive definite
+        diag_up = torch.triu(pred_boxes_covariance)
+        upper = torch.triu(pred_boxes_covariance,diagonal=1)
+        pred_boxes_covariance = torch.transpose(diag_up,1,2) + upper
+
+        pred_boxes_covariance_xywh = covar_xyxy_to_xywh(
+            pred_boxes_covariance).cpu().tolist()
+        pred_boxes_covariance_xyxy = (pred_boxes_covariance).cpu().tolist()
     else:
-        pred_boxes_covariance = []
+        pred_boxes_covariance_xywh = []
+        pred_boxes_covariance_xyxy = []
     #pred_boxes_covariance = instances.pred_boxes_covariance.cpu().tolist()
-    results = []
+    #Making sure that all variance values(from the diagonal of covariance matrix) are positives. If not, don't add to final results
+    #Sometimes an error occurs in conversion from xyxy to xywh which produces a very high negative value.  
+    
+    for cov_matrix in pred_boxes_covariance_xyxy:
+       cov_matrix = torch.tensor(cov_matrix)
+       if torch.sum(torch.diagonal(cov_matrix) < 0) > 0:
+           print('ha pelo menos uma variancia negativa!!!!!')
+
+    for cov_matrix in pred_boxes_covariance_xywh:
+        cov_matrix = torch.tensor(cov_matrix)
+        if torch.sum(torch.diagonal(cov_matrix) < 0) > 0:
+            print('ha pelo menos uma variancia negativa!!!!!')
+    
+    keep_positive_definite = []
+    for cov_matrix in pred_boxes_covariance_xyxy:
+        cov_matrix = torch.tensor(cov_matrix)
+        cov_matrix_np = np.array(cov_matrix)        
+        if not is_pos_def(cov_matrix):
+            keep_positive_definite.append(False)
+            if  torch.allclose(cov_matrix, cov_matrix.T):
+                try:
+                    np.linalg.cholesky(cov_matrix_np.astype('float64'))
+                except np.linalg.LinAlgError:
+                    print('É SIMETRICA, MAS NAO DA O CHOLESKY')
+            else:
+                print('NAO É SIMETRICA')  
+        else:
+            keep_positive_definite.append(True)
+
+
+    negative_variances = torch.sum(torch.diagonal(torch.tensor(pred_boxes_covariance_xyxy),dim1=1,dim2=2) < 0,dim=1) > 0 
+    results_xywh = []
     for k in range(num_instance):
+        #if classes[k] != -1 and not negative_variances[k]:
         if classes[k] != -1:
             result = {
                 "image_id": img_id,
                 "category_id": classes[k],
-                "bbox": boxes[k],
+                "bbox": boxes_xywh[k],
                 "score": scores[k],
                 "cls_prob": pred_cls_probs[k],
-                "bbox_covar": pred_boxes_covariance[k]
+                "bbox_covar": pred_boxes_covariance_xywh[k]
             }
 
-            results.append(result)
-    return results
+            results_xywh.append(result)
+    
+    results_xyxy = []
+    for k in range(num_instance):
+        if classes[k] != -1 and (not negative_variances[k]) and keep_positive_definite[k]:
+            result = {
+                "image_id": img_id,
+                "category_id": classes[k],
+                "bbox": boxes_xyxy[k],
+                "score": scores[k],
+                "cls_prob": pred_cls_probs[k],
+                "bbox_covar": pred_boxes_covariance_xyxy[k]
+            }
+
+            results_xyxy.append(result)
+
+    return results_xywh, results_xyxy
