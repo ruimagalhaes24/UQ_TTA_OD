@@ -51,11 +51,17 @@ from new_utils.anchor_statistics import altered_yolo_nms
 from detectron2.detectron2.structures import Boxes, pairwise_iou
 
 from torchvision.ops import batched_nms
+from torchvision import transforms
+import torchvision.transforms.functional as TF
 
 import new_utils.anchor_statistics 
 from new_utils.evaluation_utils import get_preprocess_ground_truth_instances, get_preprocess_pred_instances, get_matched_results, compute_nll, compute_calibration_uncertainty_errors, compute_average_precision
 import json
 from utils.general import xywh2xyxy 
+import numpy as np
+from utils.augmentations import letterbox
+from new_utils.augmentations_utils import augmentation_policy
+from new_utils.uncertainty_ops import remove_detections, obtain_uncertainty_statistics
 
 @torch.no_grad()
 def run(
@@ -98,9 +104,27 @@ def run(
     save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
     (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
 
+    #CONFIGS FOR RUNNING
+    inference_mode = True
+    remove_uncertain_clusters = False
+    mc_dropout = False
+    test_time_augment = False
+    kitti = False
+    #CHANGE NAME OF EXPERIMENT
+    #experiment = '/remove_uncert_SE_095_TV_33_sem_postprocess'
+    experiment = '/bdd'
+    if mc_dropout:
+        inference_output_dir = 'code/yolov5/methods/mc_dropout'
+    elif test_time_augment:
+        inference_output_dir = 'code/yolov5/methods/test_time_aug'
+    else:
+        inference_output_dir = 'code/yolov5/methods/output_redundancy'
+    inference_output_dir = inference_output_dir + experiment
+    if not (os.path.exists(inference_output_dir)):
+        os.makedirs(inference_output_dir)
     # Load model
     device = select_device(device)
-    model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half)
+    model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half, mc_enabled=mc_dropout)
     stride, names, pt = model.stride, model.names, model.pt
     imgsz = check_img_size(imgsz, s=stride)  # check image size
 
@@ -111,81 +135,158 @@ def run(
         dataset = LoadStreams(source, img_size=imgsz, stride=stride, auto=pt)
         bs = len(dataset)  # batch_size
     else:
-        dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=pt)
+        dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=pt, test_time_augmentation=test_time_augment)
         bs = 1  # batch_size
     vid_path, vid_writer = [None] * bs, [None] * bs
 
     # Run inference
     model.warmup(imgsz=(1 if pt else bs, 3, *imgsz))  # warmup
 
-    final_outputs_list = []
+    final_outputs_list_xywh = []
+    final_outputs_list_xyxy = []
     seen, windows, dt = 0, [], [0.0, 0.0, 0.0]
     #Decide if inference mode or just metrics calculation
-    inference_mode = False
     if inference_mode:
         for path, im, im0s, vid_cap, s in dataset:
             t1 = time_sync()
-            im = torch.from_numpy(im).to(device)
-            im = im.half() if model.fp16 else im.float()  # uint8 to fp16/32
-            im /= 255  # 0 - 255 to 0.0 - 1.0
-            if len(im.shape) == 3:
-                im = im[None]  # expand for batch dim
             t2 = time_sync()
             dt[0] += t2 - t1
 
             # Inference
             visualize = increment_path(save_dir / Path(path).stem, mkdir=True) if visualize else False
             #MC DROPOUT
-            #for runs in range(20):
-            #    pred = model(im,augment=augment,visualize=visualize)
-            pred = model(im, augment=augment, visualize=visualize)
-            t3 = time_sync()
-            dt[1] += t3 - t2
-            #########################
-            #Output Redundancy
-            #Convert output coordinates xywh to xyxy
-            # Rescale boxes from img_size to im0 size
-            pred_redundancy = torch.clone(pred)
-            pred_redundancy = torch.squeeze(pred_redundancy,dim=0)
-            pred_redundancy[:, :4] = xywh2xyxy(pred_redundancy[:, :4])
-            pred_redundancy[:, :4] = scale_coords(im.shape[2:], pred_redundancy[:, :4], im0s.shape).round()
-            # Rescale boxes from img_size to im0 size
-            outputs = new_utils.anchor_statistics.pre_processing_anchor_stats(pred_redundancy)
-            outputs = new_utils.anchor_statistics.compute_anchor_statistics(outputs,device,im0s,pred)
-            outputs = new_utils.anchor_statistics.probabilistic_detector_postprocessing(outputs,im0s)
-            outputs = new_utils.anchor_statistics.instances_to_json(outputs,dataset.count-1)
-            final_outputs_list.extend(outputs)
+            if mc_dropout:
+                im = torch.from_numpy(im).to(device)
+                im = im.half() if model.fp16 else im.float()  # uint8 to fp16/32
+                im /= 255  # 0 - 255 to 0.0 - 1.0
+                if len(im.shape) == 3:
+                    im = im[None]  # expand for batch dim
+                number_runs = 5
+                accumulated_predictions = torch.tensor([]).to(device)
+                for runs in range(number_runs):
+                    pred = model(im,augment=augment,visualize=visualize)
+                    keep, output = altered_yolo_nms(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
+                    pred = torch.squeeze(pred,dim=0)
+                    teste = pred[keep,:]
+                    accumulated_predictions = torch.cat((accumulated_predictions, pred[keep,:]))
+                t3 = time_sync()
+                dt[1] += t3 - t2
+                original_predictions = torch.clone(accumulated_predictions)
+                original_predictions = torch.unsqueeze(original_predictions,dim=0)
+                accumulated_predictions[:, :4] = xywh2xyxy(accumulated_predictions[:, :4])
+                accumulated_predictions[:, :4] = scale_coords(im.shape[2:], accumulated_predictions[:, :4], im0s.shape).round()
+                outputs = new_utils.anchor_statistics.pre_processing_anchor_stats(accumulated_predictions)
+                outputs = new_utils.anchor_statistics.compute_anchor_statistics(outputs,device,im0s,original_predictions, remove_uncertain_clusters)
+                outputs = new_utils.anchor_statistics.probabilistic_detector_postprocessing(outputs,im0s)
+                outputs_xywh, outputs_xyxy = new_utils.anchor_statistics.instances_to_json(outputs,dataset.count-1,kitti)
+                final_outputs_list_xywh.extend(outputs_xywh)
+                final_outputs_list_xyxy.extend(outputs_xyxy)
+            elif test_time_augment:
+                number_augments = 10
+                accumulated_predictions = torch.tensor([]).to(device)
+                #augmentations = transforms.Compose([transforms.ToPILImage(),
+                #                                    transforms.ColorJitter(brightness=(0.4,2),contrast=(0.4,2))
+                                                    #transforms.ColorJitter(contrast=(0.1,3))
+                                                    #transforms.ColorJitter(brightness=(0.2,3))
+                #                                    ])
+
+                #to_PIL = transforms.ToPILImage()
+                for i in range(number_augments):
+                    p = Path(path)  # to Path
+                    save_path = str(save_dir / p.name)  # im.jpg
+                    aug_img = im0s.copy()
+                    #aug_img = augmentations(aug_img)
+                    #aug_img = to_PIL(aug_img)
+                    #aug_img = TF.adjust_brightness(aug_img, 2)
+                    aug_img = augmentation_policy(aug_img)
+                    aug_img = np.array(aug_img)
+                    #cv2.imwrite(save_path[0:-4] + str(i) + save_path[-4:],aug_img)
+                    # Padded resize
+                    img = letterbox(aug_img, new_shape=[640,640], stride=32, auto=True)[0]
+                    # Convert
+                    img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+                    img = np.ascontiguousarray(img)
+                    im = torch.from_numpy(img).to(device)
+                    im = im.half() if model.fp16 else im.float()  # uint8 to fp16/32
+                    im /= 255  # 0 - 255 to 0.0 - 1.0
+                    if len(im.shape) == 3:
+                        im = im[None]  # expand for batch dim
+                
+                    pred = model(im,augment=augment,visualize=visualize)
+                    keep, output = altered_yolo_nms(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
+                    pred = torch.squeeze(pred,dim=0)
+                    teste = pred[keep,:]
+                    accumulated_predictions = torch.cat((accumulated_predictions, pred[keep,:]))
+                t3 = time_sync()
+                dt[1] += t3 - t2
+                original_predictions = torch.clone(accumulated_predictions)
+                original_predictions = torch.unsqueeze(original_predictions,dim=0)
+                accumulated_predictions[:, :4] = xywh2xyxy(accumulated_predictions[:, :4])
+                accumulated_predictions[:, :4] = scale_coords(im.shape[2:], accumulated_predictions[:, :4], im0s.shape).round()
+                outputs = new_utils.anchor_statistics.pre_processing_anchor_stats(accumulated_predictions)
+                outputs = new_utils.anchor_statistics.compute_anchor_statistics(outputs,device,im0s,original_predictions, remove_uncertain_clusters)
+                outputs = new_utils.anchor_statistics.probabilistic_detector_postprocessing(outputs,im0s,kitti)
+                outputs_xywh, outputs_xyxy = new_utils.anchor_statistics.instances_to_json(outputs,dataset.count-1)
+                final_outputs_list_xywh.extend(outputs_xywh)
+                final_outputs_list_xyxy.extend(outputs_xyxy)
+            else:
+                im = torch.from_numpy(im).to(device)
+                im = im.half() if model.fp16 else im.float()  # uint8 to fp16/32
+                im /= 255  # 0 - 255 to 0.0 - 1.0
+                if len(im.shape) == 3:
+                    im = im[None]  # expand for batch dim
+                pred = model(im, augment=augment, visualize=visualize)
+                t3 = time_sync()
+                dt[1] += t3 - t2
+                #########################
+                #Output Redundancy
+                #Convert output coordinates xywh to xyxy
+                # Rescale boxes from img_size to im0 size
+                pred_redundancy = torch.clone(pred)
+                pred_redundancy = torch.squeeze(pred_redundancy,dim=0)
+                pred_redundancy[:, :4] = xywh2xyxy(pred_redundancy[:, :4])
+                pred_redundancy[:, :4] = scale_coords(im.shape[2:], pred_redundancy[:, :4], im0s.shape).round()
+                # Rescale boxes from img_size to im0 size
+                outputs = new_utils.anchor_statistics.pre_processing_anchor_stats(pred_redundancy)
+                outputs = new_utils.anchor_statistics.compute_anchor_statistics(outputs,device,im0s,pred, remove_uncertain_clusters)
+                outputs = new_utils.anchor_statistics.probabilistic_detector_postprocessing(outputs,im0s)
+                outputs_xywh, outputs_xyxy = new_utils.anchor_statistics.instances_to_json(outputs,dataset.count-1,kitti)
+                #https://online.stat.psu.edu/stat505/book/export/html/645
+                #outputs = remove_detections(outputs)
+                #FUNCTION TO REMOVE UNCERTAIN DETECTIONS
+                final_outputs_list_xywh.extend(outputs_xywh)
+                final_outputs_list_xyxy.extend(outputs_xyxy)
             ##############################
             # NMS
             #pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
             dt[2] += time_sync() - t3
-
             # Second-stage classifier (optional)
             # pred = utils.general.apply_classifier(pred, classifier_model, im, im0s)
             # Process predictions
             draw_clusters = True
             if draw_clusters:
                 list_of_classes = []
-                names = ['car','bus','truck','person','rider','bycicle','motorcycle']
+                if kitti:
+                    names = ['car','truck','person','rider','bycicle']
+                else:
+                    names = ['car','bus','truck','person','rider','bycicle','motorcycle']
                 seen += 1
                 if webcam:  # batch_size >= 1
                     p, im0, frame = path[i], im0s[i].copy(), dataset.count
                     s += f'{i}: '
                 else:
                     p, im0, frame = path, im0s.copy(), getattr(dataset, 'frame', 0)
-
                 annotator = Annotator(im0, line_width=line_thickness, example=str(names))
-                for i, det in enumerate(outputs):  # per image
+                p = Path(p)  # to Path
+                save_path = str(save_dir / p.name)  # im.jpg
+                gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
+                txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')  # im.txt
+                imc = im0.copy() if save_crop else im0  # for save_crop
+                for i, det in enumerate(outputs_xywh):  # per image
                     xyxy =  [det['bbox'][0], 
                              det['bbox'][1],
                              det['bbox'][0] + det['bbox'][2],
                              det['bbox'][1] + det['bbox'][3]]
-                    p = Path(p)  # to Path
-                    save_path = str(save_dir / p.name)  # im.jpg
-                    txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')  # im.txt
-                    gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
-                    imc = im0.copy() if save_crop else im0  # for save_crop
-
                     c = int(det['category_id'])  # integer class
                     label = None if hide_labels else (names[c] if hide_conf else f'{names[c-1]} {det["score"]:.2f}')
                     annotator.box_label(xyxy, label, color=colors(c, True))
@@ -203,7 +304,6 @@ def run(
                         s += f'{i}: '
                     else:
                         p, im0, frame = path, im0s.copy(), getattr(dataset, 'frame', 0)
-
                     p = Path(p)  # to Path
                     save_path = str(save_dir / p.name)  # im.jpg
                     txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')  # im.txt
@@ -224,12 +324,10 @@ def run(
                     if len(det):
                         # Rescale boxes from img_size to im0 size
                         det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im0.shape).round()
-
                         # Print results
                         for c in det[:, -1].unique():
                             n = (det[:, -1] == c).sum()  # detections per class
                             s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
-
                         # Write results
                         for *xyxy, conf, cls in reversed(det):
                             if save_txt:  # Write to file
@@ -237,14 +335,12 @@ def run(
                                 line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
                                 with open(f'{txt_path}.txt', 'a') as f:
                                     f.write(('%g ' * len(line)).rstrip() % line + '\n')
-
                             if save_img or save_crop or view_img:  # Add bbox to image
                                 c = int(cls)  # integer class
                                 label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
                                 annotator.box_label(xyxy, label, color=colors(c, True))
                             if save_crop:
                                 save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
-
             # Stream results
             im0 = annotator.result()
             if view_img:
@@ -254,7 +350,6 @@ def run(
                     cv2.resizeWindow(str(p), im0.shape[1], im0.shape[0])
                 cv2.imshow(str(p), im0)
                 cv2.waitKey(1)  # 1 millisecond
-
             # Save results (image with detections)
             if save_img:
                 if dataset.mode == 'image':
@@ -273,27 +368,33 @@ def run(
                         save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
                         vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
                     vid_writer[i].write(im0)
-
             # Print time (inference-only)
             LOGGER.info(f'{s}Done. ({t3 - t2:.3f}s)')
         
         ##################
         #SAVE INFERENCE RESULTS TO JSON
-        inference_output_dir = 'code/yolov5/methods/output_redundancy'
-        with open(os.path.join(inference_output_dir, 'coco_instances_results.json'), 'w') as fp:
-                json.dump(final_outputs_list, fp, indent=4,
+        print('xywh has ' + str(len(final_outputs_list_xywh)) + ' final predictions')
+        print('xyxy has ' + str(len(final_outputs_list_xyxy)) + ' final predictions')
+        with open(os.path.join(inference_output_dir, 'coco_instances_results_xywh.json'), 'w') as fp:
+                json.dump(final_outputs_list_xywh, fp, indent=4,
+                        separators=(',', ': '))
+        
+        with open(os.path.join(inference_output_dir, 'coco_instances_results_xyxy.json'), 'w') as fp:
+                json.dump(final_outputs_list_xyxy, fp, indent=4,
                         separators=(',', ': '))
     
     #Compute Metrics
-    path_to_dataset = "../../media/Data/ruimag/bdd100k/labels"
-    path_to_predictions = 'code/yolov5/methods/output_redundancy'
-    path_to_results = 'code/yolov5/methods/output_redundancy'
+    if kitti:
+        path_to_dataset = "../../media/Data/ruimag/kitti/object/training/label2-COCO-Format"
+    else:
+        path_to_dataset = "../../media/Data/ruimag/bdd100k/labels"
     preprocessed_gt_instances = get_preprocess_ground_truth_instances(path_to_dataset)
-    preprocessed_pred_instances = get_preprocess_pred_instances(path_to_predictions)
-    matched_results = get_matched_results(path_to_results, preprocessed_gt_instances, preprocessed_pred_instances)
-    #mAP_results, optimal_score_threshold_f1  = compute_average_precision(path_to_results,path_to_dataset)
-    final_results_nll , final_results_per_class_nll = compute_nll(matched_results)
-    final_results_calibration = compute_calibration_uncertainty_errors(matched_results)
+    preprocessed_pred_instances = get_preprocess_pred_instances(inference_output_dir)
+    matched_results = get_matched_results(inference_output_dir, preprocessed_gt_instances, preprocessed_pred_instances)
+    teste = obtain_uncertainty_statistics(matched_results)
+    mAP_results, optimal_score_threshold_f1  = compute_average_precision(inference_output_dir,path_to_dataset,kitti)
+    final_results_nll , final_results_per_class_nll = compute_nll(matched_results,kitti)
+    final_results_calibration = compute_calibration_uncertainty_errors(matched_results,kitti)
     ########################
     if inference_mode:
         # Print results

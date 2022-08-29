@@ -124,6 +124,23 @@ def compute_reg_scores(input_matches, valid_idxs):
     upper = torch.triu(predicted_box_covars,diagonal=1)
     predicted_box_covars = torch.transpose(diag_up,1,2) + upper
 
+    count = 0
+    for i , cov_matrix in enumerate(predicted_box_covars):
+        cov_matrix_np = cov_matrix.cpu().numpy()        
+        if not is_pos_def(cov_matrix):
+            print(i)
+            count += 1
+            print(count)
+            #teste = np.linalg.eigvals(cov_matrix_np)
+            #temp = np.all(teste > 0)
+            #if np.array_equal(A, A.T):
+            if  torch.allclose(cov_matrix, cov_matrix.T):
+                try:
+                    np.linalg.cholesky(cov_matrix_np.astype('float64'))
+                except np.linalg.LinAlgError:
+                    print('É SIMETRICA, MAS NAO DA O CHOLESKY')
+            else:
+                print('NAO É SIMETRICA')
     predicted_multivariate_normal_dists = torch.distributions.multivariate_normal.MultivariateNormal(
         predicted_box_means, predicted_box_covars + 1e-2 * torch.eye(predicted_box_covars.shape[2]).to(device))
     #apanha o logaritmo da probabilidade de uma determinada sample(ground truth) pertencer à distribuiçao prevista pela prediction 
